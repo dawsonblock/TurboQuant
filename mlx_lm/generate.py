@@ -310,24 +310,32 @@ def maybe_turboquant_k_cache(
     turboquant_block_tokens=256,
 ):
     """Upgrade KVCache entries to TurboQuantKCache when the offset threshold
-    is reached.  Idempotent: already-upgraded entries are skipped."""
+    is reached.  Idempotent: already-upgraded entries are skipped.
+
+    .. deprecated::
+        This function is a legacy shim.  New callers should build a
+        :class:`turboquant.config.TurboQuantConfig` and call
+        :func:`mlx_lm.cache_upgrade.upgrade_cache_list` directly.
+    """
+    from turboquant.config import TurboQuantConfig as _TQConfig
+    from mlx_lm.cache_upgrade import upgrade_cache_list
+
     if turboquant_k_start is None:
         return
-    for e, c in enumerate(prompt_cache):
-        if isinstance(c, TurboQuantKCache):
-            continue
-        if hasattr(c, "to_turboquant") and c.offset >= turboquant_k_start:
-            prompt_cache[e] = c.to_turboquant(
-                main_bits=turboquant_main_bits,
-                group_size=turboquant_group_size,
-                rotation=turboquant_rotation,
-                return_mode=turboquant_return_mode,
-                resid_scale_bits=turboquant_resid_scale_bits,
-                v_bits=turboquant_v_bits,
-                v_group_size=turboquant_v_group_size,
-                v_enabled=turboquant_v_enabled,
-                block_tokens=turboquant_block_tokens,
-            )
+
+    # Map legacy kwarg names → production TurboQuantConfig.
+    # return_mode and resid_scale_bits have no production equivalent;
+    # upgrade_cache_list always uses view mode for the production path.
+    _cfg = _TQConfig(
+        k_bits=turboquant_main_bits,
+        k_group_size=turboquant_group_size,
+        rotation=turboquant_rotation,
+        v_bits=turboquant_v_bits,
+        v_group_size=turboquant_v_group_size,
+        v_enabled=turboquant_v_enabled,
+        block_tokens=turboquant_block_tokens,
+    )
+    upgrade_cache_list(prompt_cache, k_start=turboquant_k_start, config=_cfg)
 
 
 def generate_step(
