@@ -1,11 +1,13 @@
 """
-pytest conftest for turboquant/ tests.
-Ensures the project root is on sys.path so ``import turboquant`` works.
+Compatibility stub.  Unit tests have moved to tests/unit/.
+
+This conftest is retained so that ``pytest turboquant/tests/`` still adds the
+project root to sys.path (needed if someone runs from that directory directly).
+Canonical test command: ``pytest tests/``
 """
 import os
 import sys
 
-# Project root is two levels up from this file (turboquant/tests/conftest.py)
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
