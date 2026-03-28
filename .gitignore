@@ -32,6 +32,10 @@ htmlcov/
 # macOS
 .DS_Store
 
+# Type checker caches
+.mypy_cache/
+.ruff_cache/
+
 # Editor
 .vscode/
 *.swp

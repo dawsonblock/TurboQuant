@@ -6,8 +6,10 @@ fixtures from test_turboquant_gemma.py so the cache config is identical
 to the unit tests.
 """
 import sys, os, time
-sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tests"))
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "tests"))
 
 import mlx.core as mx
 from test_turboquant_gemma import _make_tq_cache, _make_kv, PREFILL_LEN
