@@ -22,8 +22,10 @@ class TurboQuantConfig:
     v_enabled: bool = True
 
     # ── Rotation ─────────────────────────────────────────────────────────────
-    # "hadamard"        — fast Walsh-Hadamard, best quality, requires d = 2^k
-    #                     (will pad to next power of two if needed)
+    # "hadamard"        — dense Hadamard matrix (built once at init, applied via matmul).
+    #                     Orthogonal; equalises per-dimension variance.
+    #                     Requires d = 2^k (pads to next power of two if needed).
+    #                     Cost is O(d²) per token — not a fast butterfly transform.
     # "random_orthogonal" — QR-decomposed Gaussian, works for any d, slower
     # "identity"        — no rotation; use only for debugging
     rotation: Literal["identity", "hadamard", "random_orthogonal"] = "hadamard"

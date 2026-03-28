@@ -2,7 +2,7 @@
 
 # ⚡ TurboQuant
 
-**Production KV-cache compression for Apple Silicon LLMs**
+**Research-grade KV-cache compression for Apple Silicon LLMs**
 
 [![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen)](#running-tests)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://python.org)
@@ -18,6 +18,11 @@
 ## What
 
 TurboQuant compresses the KV cache of transformer models running on Apple Silicon via [mlx-lm](https://github.com/ml-explore/mlx-lm). It cuts memory ~4× with no perceptible latency cost — the encode step is **3× faster** than a naive baseline.
+
+> **⚠️ Current status:** This is a *serious prototype*, not a production system.
+> Gemma is the only wired architecture. Compression quality (perplexity impact) has **not** been measured at scale.
+> No fused Metal kernel exists yet — the hot path runs in Python-level MLX.
+> Do not treat the memory/latency numbers as production benchmarks.
 
 ```
 Dense KV cache (fp16, 1K tokens, Gemma-2B)   1024 KB
@@ -64,7 +69,7 @@ Decode K (streaming attention)
 ```
 
 **Key design choices:**
-- **Hadamard whitening** — orthogonal rotation equalises per-dimension variance, making per-group scalar quantisation nearly optimal
+- **Hadamard whitening** — precomputed dense Hadamard matrix (built once at init, applied via `matmul`); orthogonal rotation equalises per-dimension variance, making per-group scalar quantisation nearly optimal. *Not* a fast butterfly transform — cost is O(d²) per token.
 - **Top-k sparse residual** — stores the k=2 largest-magnitude quantisation errors per group (fp16 value + uint8 index); recovers the dominant signal the main quantiser misses
 - **Two-phase bit-packing** — pad to group boundary, then to word boundary; handles any bit-width (including 3-bit) for any head-dim
 - **Single execution path** — no `return_mode` toggle, no dtype fallbacks; the config selects operations once at init
@@ -83,7 +88,7 @@ pip install mlx mlx-lm          # only hard dependencies
 
 ## Quick start
 
-### Production interface
+### Core interface
 
 ```python
 from turboquant import KVCompressor, TurboQuantConfig

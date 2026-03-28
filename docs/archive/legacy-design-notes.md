@@ -1,3 +1,15 @@
+> **⚠️ ARCHIVED — legacy design notes**
+>
+> This document describes the prototype `TurboQuantKCache` implementation that
+> lives in `mlx_lm/models/cache.py`.  It uses a different residual encoding
+> scheme (group-projection sign sketch) and a different config schema
+> (`main_bits`, `group_size`, `return_mode`, …) than the production
+> `KVCompressor` in the `turboquant/` package.
+>
+> For the current architecture see `docs/architecture.md`.
+
+---
+
 Below is a single consolidated TurboQuantKCache scaffold that merges the pieces we built:
 	•	packed low-bit K
 	•	compact K scales
