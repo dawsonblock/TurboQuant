@@ -1,0 +1,15 @@
+{
+  "k_bits": 3,
+  "k_group_size": 64,
+  "v_bits": 4,
+  "v_group_size": 64,
+  "v_enabled": true,
+  "rotation": "hadamard",
+  "rotation_seed": 42,
+  "residual_topk": 2,
+  "block_tokens": 256,
+  "allocation_step": 512,
+  "eps": 1e-6,
+  "scale_dtype": "float16",
+  "v_scale_dtype": "float16"
+}

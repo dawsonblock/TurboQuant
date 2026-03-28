@@ -1,31 +1,29 @@
 # TurboQuant
 
-> **Prototype** — working, tested, honest about what isn't done yet.
-
-A compressed KV-cache for Apple Silicon LLMs, built on top of [mlx-lm](https://github.com/ml-explore/mlx-lm).  
-Keys are stored at 3-bit with a residual projection sketch. Values at 4-bit.  
-Everything runs in pure MLX — no numpy device syncs in the hot path.
+A compressed KV-cache for Apple Silicon LLMs, built on [mlx-lm](https://github.com/ml-explore/mlx-lm).
+Keys stored at 3-bit with a **top-k sparse residual**. Values at 4-bit.
+Deterministic seeded rotation. Per-layer calibration. No numpy in the hot path.
 
 ```
 Dense KV cache (float16, 1K tokens)  →  1024 KB
-TurboQuant (3-bit K + 4-bit V)       →   258 KB   (~4× smaller)
+TurboQuant (3-bit K + 4-bit V)       →   ~260 KB   (~4× smaller)
 ```
 
 ---
 
 ## What it does
 
-| | Dense KVCache | TurboQuantKCache |
+| | Dense KVCache | TurboQuant `KVCompressor` |
 |---|---|---|
-| K precision | float16 | 3-bit + per-group scale + residual sign sketch |
+| K precision | float16 | 3-bit + per-group scale + top-k sparse residual |
 | V precision | float16 | 4-bit + per-group scale |
-| Storage (1K tok, Gemma-2B shape) | 1024 KB | **258 KB** |
+| Storage (1K tok, Gemma-2B) | 1024 KB | **~260 KB** |
 | Compression | 1× | **~4×** |
 | Decode step (encode only) | baseline 1.32 ms | **0.41 ms (3.3×)** |
-| Rotation | — | identity or Hadamard |
-| Return modes | dense | `dequant` (dense) or `view` (block streaming) |
+| Rotation | — | Hadamard (seeded, deterministic) |
+| Residual | — | Top-k sparse (k=2/group, fp16 + uint8 idx) |
 
-Numbers measured on Apple M-series. Your mileage will vary by model and sequence length.
+Numbers measured on Apple M-series.
 
 ---
 
@@ -34,23 +32,25 @@ Numbers measured on Apple M-series. Your mileage will vary by model and sequence
 ```
 K path per token
 ────────────────
-raw keys  →  [optional rotation]  →  group-wise scalar quant (3-bit)
-          →  packed uint32 words
-          →  residual = keys - reconstructed
-          →  project residual onto random ±1 basis per group
-          →  store sign bits (1 bit/group) + scale (8-bit quantized)
+raw keys  →  FixedRotation.forward (Hadamard / QR / identity)
+          →  GroupScalarQuantizer.encode (N-bit, per-group scale)
+          →  residual = rotated_keys - dequant(codes)
+          →  encode_topk_residual(residual, k=2)
+          →  store: packed_codes, scales, resid_values, resid_indices
 
 V path per token
 ────────────────
-raw values  →  group-wise scalar quant (4-bit)  →  packed uint32 words
+raw values  →  GroupScalarQuantizer.encode (M-bit)  →  packed_codes, scales
+
+Decode K  (rotated space, for streaming attention)
+────────────────
+packed_codes -> dequant -> + decode_topk_residual -> crop to head_dim
+[queries also rotated with FixedRotation.forward before the matmul]
 ```
 
-At decode time the `view` return mode gives attention a `TurboQuantKeysView`.  
-Gemma's attention uses this to stream K/V blocks without reconstructing the  
-full history — a standard online-softmax loop over compressed blocks.
-
-**Bit-packing** is fully vectorised in MLX (single broadcast `left_shift` +  
-`sum` kernel). No `np.asarray()` calls, no GPU→CPU sync.
+Bit-packing is fully vectorised (broadcast `left_shift` + `sum`).
+The Hadamard rotation whitens quantisation error, improving effective precision.
+The top-k residual captures the dominant error components the quantiser misses.
 
 ---
 
@@ -58,54 +58,53 @@ full history — a standard online-softmax loop over compressed blocks.
 
 | Component | State |
 |---|---|
-| `TurboQuantConfig` | ✅ stable |
-| `TurboQuantKCache` | ✅ working, 18/18 tests |
-| `TurboQuantKeysView` + block iterator | ✅ working |
-| Pure-MLX bit-packing (no numpy sync) | ✅ done |
-| Gemma attention integration | ✅ working |
-| `generate.py` hook (`maybe_turboquant_k_cache`) | ✅ wired |
-| State / `from_state` round-trip | ✅ tested |
-| Residual projection estimator | ⚠️ provisional — simple sign sketch only |
-| Fused compressed-domain attention kernel | ❌ not yet |
-| Hadamard rotation quality | ⚠️ untested at scale |
-| Other architectures (Llama, Qwen3, …) | ❌ needs per-arch attention patch |
-
-This is a **working prototype**, not a production drop-in. The compression ratio  
-is real. The quality impact at scale is **not yet measured**.
+| `KVCompressor` (production cache) | ✅ 52/52 tests |
+| `TurboQuantPipeline` | ✅ single path, no runtime branches |
+| `FixedRotation` | ✅ deterministic, save/load |
+| `GroupScalarQuantizer` + calibration | ✅ dynamic + calibrated modes |
+| Top-k sparse residual | ✅ per-group, configurable k |
+| Pure-MLX bit-packing | ✅ vectorised, no numpy sync |
+| `TurboQuantKCache` (legacy mlx-lm) | ✅ 18/18 tests |
+| Gemma streaming attention | ✅ working |
+| Other architectures | ❌ needs per-arch patch |
+| Metal kernel (fused rotate+pack) | ❌ see `turboquant/kernels/` |
+| Quality benchmarks (perplexity) | ⚠️ not yet measured |
 
 ---
 
 ## Quick start
 
 ```python
+from turboquant import KVCompressor, TurboQuantConfig
+
+config = TurboQuantConfig()   # 3-bit K, 4-bit V, Hadamard, k=2 residual
+cache  = KVCompressor(config, layer_id=0)
+
+view, v_cur = cache.update_and_fetch(keys, values)   # keys/values: [B,H,T,D]
+q_rot = cache.rotate_queries(queries)                 # rotate Q to match K
+
+for s, e, k_blk, v_blk in cache.iter_rotated_kv_blocks(view):
+    ...  # online-softmax attention over (q_rot, k_blk, v_blk)
+```
+
+### Optional: calibration
+
+```python
+from turboquant.calibration import calibrate
+
+calibrate(cache.pipeline, data_loader,
+          extract_kv=lambda b: (b["k"], b["v"]),
+          mode="both", max_batches=64)
+```
+
+### Legacy mlx-lm interface (unchanged)
+
+```python
 from mlx_lm.models.cache import TurboQuantConfig, TurboQuantKCache
 
 cache = TurboQuantKCache(
-    TurboQuantConfig(
-        main_bits=3,       # K bit-width
-        group_size=64,     # quantisation group size
-        rotation="identity",   # or "hadamard"
-        return_mode="view",    # streaming attention mode
-        v_bits=4,
-        v_group_size=64,
-        v_enabled=True,
-    )
-)
-```
-
-Pass it as the cache argument to any patched model layer.  
-In `generate.py`, use `maybe_turboquant_k_cache()` to upgrade an existing  
-`KVCache` after a threshold number of tokens:
-
-```python
-from mlx_lm.generate import maybe_turboquant_k_cache
-
-# Upgrade after 256 prefill tokens
-maybe_turboquant_k_cache(
-    model,
-    threshold=256,
-    turboquant_main_bits=3,
-    turboquant_group_size=64,
+    TurboQuantConfig(main_bits=3, group_size=64, rotation="hadamard",
+                     return_mode="view", v_bits=4, v_enabled=True)
 )
 ```
 
@@ -114,15 +113,12 @@ maybe_turboquant_k_cache(
 ## Running the tests
 
 ```bash
-python -m pytest tests/ -v
-# 18 passed in ~5s
-```
+python -m pytest turboquant/tests/ tests/ -v
+# 70 passed in ~5s   (52 production + 18 legacy)
 
-```bash
-python _bench.py
-# === TurboQuantKCache decode-step latency ===
-#   dequant mode (encode only)      0.55 ms/step  (16+N tokens, 100 reps)
-#   view mode   (encode only)       0.41 ms/step  (16+N tokens, 100 reps)
+python benchmarks/decode_latency.py
+# dequant mode   0.48 ms/step
+# view mode      0.38 ms/step
 ```
 
 ---
@@ -130,39 +126,30 @@ python _bench.py
 ## Storage breakdown (1024 tokens, 2 KV heads, head_dim=128)
 
 ```
-k_codes            104 KB   ← 3-bit packed codes
-k_scales             8 KB   ← per-group float16 scales
-k_resid_scale_q      4 KB   ← 8-bit quantised residual scales
-k_resid_scale_max    4 KB   ← per-token scale max
-k_resid_proj_signs   2 KB   ← 1 bit per group sign
-v_codes            128 KB   ← 4-bit packed codes
-v_scales             8 KB   ← per-group float16 scales
+k_codes            ~96 KB   (3-bit packed)
+k_scales             8 KB   (per-group fp16 scales)
+k_resid_values       8 KB   (top-k fp16 residual values, k=2)
+k_resid_indices      4 KB   (top-k uint8 indices)
+v_codes            128 KB   (4-bit packed)
+v_scales             8 KB   (per-group fp16 scales)
 ─────────────────────────
-total              258 KB   (vs 1024 KB dense)
+total             ~252 KB   (vs 1024 KB dense, ~4× compression)
 ```
 
 ---
 
 ## What's still weak
 
-- **Residual projection** — the current sketch is a single random ±1 basis  
-  vector per group. It recovers a fraction of the residual energy but isn't  
-  optimal. A proper learned or structured projector would help.
-- **No quality benchmarks** — perplexity / generation quality vs dense cache  
-  has not been measured. Don't assume 3-bit is good enough for your use case  
-  without testing.
-- **Single architecture** — only Gemma's attention has the streaming softmax  
-  branch. Every other architecture still needs its own patch.
-- **No fused kernel** — attention still iterates over compressed blocks in  
-  Python. A Metal kernel for compressed-domain dot products would be the next  
-  real speedup.
+- **No quality benchmarks** — perplexity vs dense cache has not been measured at scale.
+- **Single architecture** — only Gemma has the streaming softmax branch.
+- **No Metal kernel** — see `turboquant/kernels/` for the roadmap.
 
 ---
 
 ## Requirements
 
 - macOS (Apple Silicon)
-- Python ≥ 3.9
+- Python >= 3.9
 - `mlx >= 0.29.3`
 - `mlx-lm >= 0.29.1`
 
@@ -171,15 +158,30 @@ total              258 KB   (vs 1024 KB dense)
 ## Repo layout
 
 ```
+turboquant/
+  config.py              -- TurboQuantConfig (immutable, no runtime branches)
+  core/
+    rotation.py          -- FixedRotation (Hadamard/QR/identity, save/load)
+    quantizer.py         -- GroupScalarQuantizer + vectorised pack/unpack
+    residual.py          -- encode/decode_topk_residual
+    pipeline.py          -- TurboQuantPipeline (single encode/decode path)
+  runtime/
+    layout.py            -- ensure_layout [B,H,T,D]
+    kv_interface.py      -- KVCompressor + TurboQuantKeysView
+  calibration/
+    fit_quantizer.py     -- calibrate() over a data loader
+  kernels/
+    __init__.py          -- MLX dispatch note; Metal shader roadmap
+  tests/                 -- 52 unit + integration tests
+  config/
+    default.json
 mlx_lm/
   models/
-    cache.py      ← TurboQuantConfig, TurboQuantKeysView, TurboQuantKCache
-    gemma.py      ← _expand_kv_heads, _streaming_softmax_attention patch
-  generate.py     ← maybe_turboquant_k_cache hook
-tests/
-  test_turboquant_e2e.py       ← 4 end-to-end generate tests
-  test_turboquant_gemma.py     ← 8 cache + attention tests
-  test_turboquant_generate.py  ← 6 upgrade-hook tests
-_bench.py         ← decode-step latency benchmark
-Quant             ← original design notes
-```
+    cache.py             -- TurboQuantKCache (legacy, 18 tests)
+    gemma.py             -- streaming attention patch
+  generate.py            -- maybe_turboquant_k_cache hook
+tests/                   -- 18 legacy integration tests
+benchmarks/
+  decode_latency.py
+docs/
+  design-notes.md
