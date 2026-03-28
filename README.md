@@ -2,9 +2,8 @@
 
 # ⚡ TurboQuant
 
-**Research-grade KV-cache compression for Apple Silicon LLMs**
+**Research-grade KV-cache compression for Apple Silicon MLX LLMs**
 
-[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen)](#running-tests)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://python.org)
 [![MLX](https://img.shields.io/badge/MLX-0.29.3%2B-orange)](https://github.com/ml-explore/mlx)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://apple.com/mac)
@@ -17,12 +16,13 @@
 
 ## What
 
-TurboQuant compresses the KV cache of transformer models running on Apple Silicon via [mlx-lm](https://github.com/ml-explore/mlx-lm). It cuts memory ~4× with no perceptible latency cost at typical decode lengths.
+TurboQuant compresses the KV cache of transformer models running on Apple Silicon via [mlx-lm](https://github.com/ml-explore/mlx-lm). It targets memory reduction first. End-to-end latency depends on model, shape, and decode length, and is not publicly certified by generic CI.
 
 > **⚠️ Current status:** Serious prototype. Gemma and Llama families are wired.
 > Compression quality (perplexity impact) has **not** been measured at scale.
 > No fused Metal kernel exists yet — the hot path runs in Python-level MLX.
 > Do not treat the memory/latency numbers as production benchmarks.
+> Supported surface is documented in [docs/supported-surface.md](docs/supported-surface.md). Release gating is documented in [docs/release-checklist.md](docs/release-checklist.md).
 
 ```
 Dense KV cache (fp16, 1K tokens, 2 heads, head_dim=128)   1024 KB
@@ -35,7 +35,7 @@ TurboQuant (3-bit K + 4-bit V, group=64)                   ~252 KB   ▸ ~4× sm
 | V storage | fp16 | **4-bit** + per-group scale |
 | 1K token footprint | 1024 KB | **~252 KB** |
 | Encode latency | ~1.3 ms | **~0.4 ms** (3×) |
-| Rotation | — | Hadamard (seeded, deterministic) |
+| Rotation | — | Hadamard / Hadamard-derived orthogonal (deterministic) |
 | Residual | — | Top-k sparse (k=2/group) |
 
 > Measured on Apple M-series, bs=1, 2 KV heads, head\_dim=128.
@@ -69,11 +69,11 @@ Decode K (streaming attention)
 ```
 
 **Key design choices:**
-- **Hadamard whitening** — precomputed dense Hadamard matrix (built once at init, applied via `matmul`); orthogonal rotation equalises per-dimension variance, making per-group scalar quantisation nearly optimal. *Not* a fast butterfly transform — cost is O(d²) per token.
+- **Hadamard-family whitening** — exact dense Hadamard matrix for power-of-two head dims, or a deterministic Hadamard-derived orthogonal fallback otherwise; the rotation equalises per-dimension variance while preserving `R.T @ R = I`. *Not* a fast butterfly transform — cost is O(d²) per token.
 - **Top-k sparse residual** — stores the k=2 largest-magnitude quantisation errors per group (fp16 value + uint8 index); recovers the dominant signal the main quantiser misses
 - **Two-phase bit-packing** — pad to group boundary, then to word boundary; handles any bit-width (including 3-bit) for any head-dim
 - **Single execution path** — config selects operations once at init; no runtime branches.
-- **Versioned state schema** — `state()` dicts carry `schema_version: 1`; `validate_state()` enforces correctness on restore.
+- **Versioned state schema** — `state()` dicts carry `schema_version: 2`; `validate_state()` enforces correctness on restore.
 
 ---
 
@@ -82,8 +82,10 @@ Decode K (streaming attention)
 ```bash
 git clone https://github.com/dawsonblock/TurboQuant
 cd TurboQuant
-pip install mlx mlx-lm          # only hard dependencies
+python -m pip install -e '.[apple]'
 ```
+
+`mlx` only installs on Apple Silicon. On non-Apple runners, use the packaging and syntax checks only.
 
 ---
 
@@ -94,7 +96,7 @@ pip install mlx mlx-lm          # only hard dependencies
 ```python
 from turboquant import KVCompressor, TurboQuantConfig
 
-# Defaults: 3-bit K, 4-bit V, Hadamard rotation, k=2 sparse residual
+# Defaults: 3-bit K, 4-bit V, Hadamard-family rotation, k=2 sparse residual
 config = TurboQuantConfig()
 cache  = KVCompressor(config, layer_id=0)
 
@@ -151,6 +153,9 @@ config = TurboQuantConfig(
 
 ### Legacy mlx-lm cache
 
+`turboquant_return_mode` and `turboquant_resid_scale_bits` remain in the legacy shim for backward compatibility, but the production upgrade path ignores them. Real residual behavior is controlled by `residual_topk`.
+
+
 ```python
 from mlx_lm.models.cache import TurboQuantConfig, TurboQuantKCache
 
@@ -174,6 +179,16 @@ pytest tests/unit/
 # Integration tests only  (mlx_lm + turboquant, 18 tests)
 pytest tests/integration/
 ```
+
+## Local runtime validation
+
+For real MLX runtime certification on Apple Silicon, run:
+
+```bash
+./scripts/validate_apple_silicon.sh
+```
+
+Public CI only checks packaging and syntax. It does not certify MLX runtime behavior. See [docs/validation-local.md](docs/validation-local.md).
 
 ---
 
@@ -276,7 +291,7 @@ mlx_lm/                        patched mlx-lm
 │   ├── gemma.py               wired → turboquant_streaming_attention
 │   └── llama.py               wired → turboquant_streaming_attention
 ├── cache_upgrade.py           upgrade_cache_list() — canonical upgrade API
-└── generate.py                maybe_turboquant_k_cache (deprecated shim)
+└── generate.py                maybe_turboquant_k_cache (deprecated compatibility shim)
 
 tests/
 ├── unit/                      52 turboquant package tests
@@ -307,7 +322,7 @@ docs/
 | `GroupScalarQuantizer` + offline calibration | ✅ dynamic + calibrated |
 | Top-k sparse residual | ✅ per-group, configurable k |
 | Pure-MLX bit-packing | ✅ vectorised, no numpy sync |
-| Versioned state schema (`schema_version: 1`) | ✅ `validate_state()` enforced |
+| Versioned state schema (`schema_version: 2`) | ✅ `validate_state()` enforced |
 | `TurboQuantKCache` adapter (legacy API) | ✅ tests 18 / 18 |
 | Shared streaming attention adapter | ✅ `turboquant.runtime.attention` |
 | Gemma streaming attention | ✅ wired |

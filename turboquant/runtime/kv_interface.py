@@ -411,6 +411,10 @@ class KVCompressor:
         def _sl(a, n):
             return a[:, :, :n, ...] if a is not None else None
 
+        k_quant = self.pipeline._k_quant
+        v_quant = self.pipeline._v_quant
+        cfg = self.config
+
         s = {
             "schema_version": STATE_SCHEMA_VERSION,
             "offset":     self.offset,
@@ -418,12 +422,25 @@ class KVCompressor:
             "d_pad":      self.pipeline._d_pad,
             "v_dim":      self.pipeline._v_dim,
             "v_pad":      self.pipeline._v_pad,
+            "k_bits":     cfg.k_bits,
+            "k_group_size": cfg.k_group_size,
+            "v_bits":     cfg.v_bits,
+            "v_group_size": cfg.v_group_size,
+            "v_enabled":  cfg.v_enabled,
+            "rotation":   cfg.rotation,
+            "rotation_seed": cfg.rotation_seed,
+            "residual_topk": cfg.residual_topk,
+            "scale_dtype": cfg.scale_dtype,
+            "v_scale_dtype": cfg.v_scale_dtype,
+            "eps":        cfg.eps,
             "k_packed":   _np(_sl(self._k_packed,   T)),
             "k_scales":   _np(_sl(self._k_scales,   T)),
             "resid_vals": _np(_sl(self._resid_vals, T)),
             "resid_idx":  _np(_sl(self._resid_idx,  T)),
             "v_packed":   _np(_sl(self._v_packed,   T)),
             "v_scales":   _np(_sl(self._v_scales,   T)),
+            "k_calibrated_scales": _np(k_quant.calibration_state()) if k_quant is not None else None,
+            "v_calibrated_scales": _np(v_quant.calibration_state()) if v_quant is not None else None,
         }
         return s
 
@@ -461,6 +478,13 @@ class KVCompressor:
         obj.pipeline._d_pad  = state.get("d_pad")
         obj.pipeline._v_dim  = state.get("v_dim")
         obj.pipeline._v_pad  = state.get("v_pad")
+
+        k_cal = state.get("k_calibrated_scales")
+        v_cal = state.get("v_calibrated_scales")
+        if k_cal is not None:
+            obj.pipeline._get_k_quant().load_calibration_state(k_cal)
+        if v_cal is not None:
+            obj.pipeline._get_v_quant().load_calibration_state(v_cal)
 
         if obj._k_packed is not None:
             obj._cap = obj._k_packed.shape[2]

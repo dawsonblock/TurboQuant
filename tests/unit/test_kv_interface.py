@@ -176,3 +176,33 @@ def test_update_rejects_3d_keys():
     cache = KVCompressor(cfg)
     with pytest.raises(ValueError):
         cache.update_and_fetch(mx.zeros((2, 4, 8)), mx.zeros((1, 2, 4, 16)))
+
+
+def test_state_restore_rejects_config_mismatch():
+    cfg = _default_cfg(rotation="identity", residual_topk=2)
+    cache = KVCompressor(cfg)
+    k = _rand((1, 2, 4, 32), seed=21)
+    v = _rand((1, 2, 4, 32), seed=22)
+    cache.update_and_fetch(k, v)
+
+    st = cache.state()
+    bad_cfg = _default_cfg(rotation="identity", residual_topk=4)
+    with pytest.raises(ValueError, match="State/config mismatch"):
+        KVCompressor.from_state(st, bad_cfg)
+
+
+def test_state_restore_preserves_calibration_state():
+    cfg = _default_cfg(rotation="identity")
+    cache = KVCompressor(cfg)
+    cache.pipeline.fit_k(_rand((64, 32), seed=11))
+    cache.pipeline.fit_v(_rand((64, 32), seed=12))
+
+    k = _rand((1, 2, 4, 32), seed=13)
+    v = _rand((1, 2, 4, 32), seed=14)
+    cache.update_and_fetch(k, v)
+
+    st = cache.state()
+    cache2 = KVCompressor.from_state(st, cfg)
+
+    assert cache2.pipeline._k_quant is not None and cache2.pipeline._k_quant.is_calibrated
+    assert cache2.pipeline._v_quant is not None and cache2.pipeline._v_quant.is_calibrated

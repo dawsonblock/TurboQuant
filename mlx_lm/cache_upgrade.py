@@ -138,14 +138,15 @@ def upgrade_cache_list(
 
         # Upgrade: map production TurboQuantConfig → legacy to_turboquant kwargs.
         # The production path always uses view mode (streaming attention).
-        # resid_scale_bits is a legacy field with no production equivalent;
-        # default 8 is safe.
+        # resid_scale_bits remains adapter metadata only; residual_topk carries
+        # the actual sparse-residual behavior into the production compressor.
         prompt_cache[i] = c.to_turboquant(
             main_bits=config.k_bits,
             group_size=config.k_group_size,
             rotation=config.rotation,
             return_mode="view",
             resid_scale_bits=8,
+            residual_topk=config.residual_topk,
             v_bits=config.v_bits,
             v_group_size=config.v_group_size,
             v_enabled=config.v_enabled,

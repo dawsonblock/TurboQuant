@@ -46,6 +46,7 @@ def test_noop_when_threshold_is_none():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=64,
         turboquant_v_enabled=True,
@@ -67,6 +68,7 @@ def test_noop_before_threshold():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=64,
         turboquant_v_enabled=True,
@@ -90,6 +92,7 @@ def test_upgrades_at_threshold():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=8,
         turboquant_v_enabled=True,
@@ -114,6 +117,7 @@ def test_preserves_offset_and_state_shape():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=8,
         turboquant_v_enabled=True,
@@ -140,6 +144,7 @@ def test_idempotent():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=8,
         turboquant_v_enabled=True,
@@ -152,6 +157,31 @@ def test_idempotent():
     maybe_turboquant_k_cache(prompt_cache, **kwargs)
     assert prompt_cache[0] is first, "Second call should return the same TurboQuantKCache"
     assert isinstance(prompt_cache[0], TurboQuantKCache)
+
+
+def test_upgrade_preserves_residual_topk():
+    """Canonical upgrade path must preserve the requested sparse residual count."""
+    threshold = 16
+    prompt_cache = _make_dense_prompt_cache(offset=threshold)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=threshold,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="dequant",
+        turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=4,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    tq = prompt_cache[0]
+    assert isinstance(tq, TurboQuantKCache)
+    assert tq.config.residual_topk == 4
+    assert tq._impl.config.residual_topk == 4
 
 
 def test_upgraded_cache_accepts_more_tokens():
@@ -170,6 +200,7 @@ def test_upgraded_cache_accepts_more_tokens():
         turboquant_rotation="identity",
         turboquant_return_mode="dequant",
         turboquant_resid_scale_bits=8,
+        turboquant_residual_topk=2,
         turboquant_v_bits=4,
         turboquant_v_group_size=8,
         turboquant_v_enabled=True,
@@ -189,3 +220,22 @@ def test_upgraded_cache_accepts_more_tokens():
     # result_k carries at least the new token
     assert result_k is not None
     assert result_v is not None
+
+
+def test_deprecated_dead_knobs_warn():
+    prompt_cache = _make_dense_prompt_cache(offset=8)
+    threshold = 4
+    with pytest.deprecated_call():
+        maybe_turboquant_k_cache(
+            prompt_cache,
+            turboquant_k_start=threshold,
+            turboquant_main_bits=3,
+            turboquant_group_size=8,
+            turboquant_rotation="identity",
+            turboquant_return_mode="dequant",
+            turboquant_resid_scale_bits=7,
+            turboquant_residual_topk=2,
+            turboquant_v_bits=4,
+            turboquant_v_group_size=8,
+            turboquant_v_enabled=True,
+        )

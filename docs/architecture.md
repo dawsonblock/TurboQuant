@@ -147,7 +147,7 @@ do not need to re-infer shapes.
 
 ### 3.6 State schema (`turboquant/runtime/state.py`)
 
-State dicts carry `schema_version: 1`.  `validate_state(state, config)` checks:
+State dicts carry `schema_version: 2`.  `validate_state(state, config)` checks:
 
 - `schema_version` present and equal to `STATE_SCHEMA_VERSION`
 - Required scalar keys: `offset`, `d_head`, `d_pad`, `v_dim`, `v_pad`
@@ -200,3 +200,8 @@ The V component is analogous.  At 3-bit K + 4-bit V with group=64 and float16 sc
 - **Residual** is top-k sparse; the legacy sign-sketch residual is not supported in the production path.
 - **V quantisation** is disabled by default for some model families where V quantisation degrades quality.
 - **Llama** wiring is complete (see [integration.md](integration.md)).  Other model families require a one-line `maybe_turboquant_attention` dispatch.
+
+
+## 7. Validation boundary
+
+This repository now includes packaging metadata and public static CI, but that CI does not certify MLX runtime behavior. Real runtime validation still requires an Apple Silicon Mac with `mlx` installed. Use `scripts/validate_apple_silicon.sh` for the supported local validation path.

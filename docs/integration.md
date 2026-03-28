@@ -99,8 +99,8 @@ If you have old code using `TurboQuantConfig(main_bits=3, group_size=64, ...)`:
 | `main_bits` | `k_bits` | |
 | `group_size` | `k_group_size` | |
 | `rotation` | `rotation` | same values |
-| `return_mode` | — | handled by adapter |
-| `resid_scale_bits` | — | ignored; production uses top-k |
+| `return_mode` | — | adapter-only; production upgrade path always uses streaming view mode |
+| `resid_scale_bits` | — | adapter metadata only; production residual behavior is `residual_topk` |
 | `residual` | — | ignored |
 | `v_bits` | `v_bits` | |
 | `v_group_size` | `v_group_size` | |

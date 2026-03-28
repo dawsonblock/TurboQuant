@@ -11,7 +11,7 @@
 
 | key | type | description |
 |---|---|---|
-| `schema_version` | `int` | always `1` |
+| `schema_version` | `int` | always `2` |
 | `offset` | `int` | number of tokens stored |
 | `d_head` | `int` | original (un-padded) head dimension |
 | `d_pad` | `int` | padded head dimension (multiple of group_size) |
@@ -103,7 +103,7 @@ index  field
 `ValueError` for:
 
 - Missing `schema_version`
-- `schema_version` ≠ `STATE_SCHEMA_VERSION` (currently 1)
+- `schema_version` ≠ `STATE_SCHEMA_VERSION` (currently 2)
 - Missing required scalar keys
 - `k_packed.shape[2]` < `state["offset"]`
 - Group count in `k_scales` inconsistent with `config.k_group_size` (if config provided)

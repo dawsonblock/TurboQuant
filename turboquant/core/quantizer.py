@@ -267,6 +267,14 @@ class GroupScalarQuantizer:
     def is_calibrated(self) -> bool:
         return self._calibrated_scales is not None
 
+    def calibration_state(self) -> Optional[mx.array]:
+        """Return calibrated scales for serialization, if present."""
+        return self._calibrated_scales
+
+    def load_calibration_state(self, scales) -> None:
+        """Restore calibrated scales from MLX or NumPy data."""
+        self._calibrated_scales = None if scales is None else mx.array(scales)
+
     # ── Encode / decode ───────────────────────────────────────────────────────
 
     def encode(self, x: mx.array) -> Tuple[mx.array, mx.array]:
