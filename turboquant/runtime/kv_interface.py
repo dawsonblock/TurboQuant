@@ -305,6 +305,56 @@ class KVCompressor:
 
             yield s, e, k_blk, v_blk
 
+    def decode_all_and_attend(
+        self,
+        q_rot: mx.array,
+        view: "TurboQuantKeysView",
+        *,
+        scale: float,
+    ) -> mx.array:
+        """Single-shot decode + ``mx.fast.scaled_dot_product_attention``.
+
+        Faster than the block-streaming loop for single-token decode steps
+        (L_q = 1).  Decodes the entire K/V history ``[view.start, view.end)``
+        in one kernel dispatch and delegates to the fused Metal SDPA kernel.
+
+        Parameters
+        ----------
+        q_rot   [B, H, 1, D]          queries, already rotated
+        view    TurboQuantKeysView     specifies [start, end) window
+        scale   float                  attention scale (1/sqrt(d_head))
+
+        Returns
+        -------
+        mx.array  [B, H, 1, D]  context vectors
+        """
+        cfg = self.config
+        assert self._k_packed is not None, "cache is empty"
+        pk = self._k_packed[:, :, view.start:view.end, :]
+        ks = self._k_scales[:, :, view.start:view.end, :]
+        rv = (
+            self._resid_vals[:, :, view.start:view.end, :, :]
+            if cfg.residual_topk > 0
+            else None
+        )
+        ri = (
+            self._resid_idx[:, :, view.start:view.end, :, :]
+            if cfg.residual_topk > 0
+            else None
+        )
+        k_all = self.pipeline.decode_k_rotated(pk, ks, rv, ri)
+
+        if cfg.v_enabled and self._v_packed is not None:
+            pv = self._v_packed[:, :, view.start:view.end, :]
+            vs = self._v_scales[:, :, view.start:view.end, :]
+            v_all = self.pipeline.decode_v(pv, vs)
+        else:
+            v_all = mx.zeros_like(k_all)
+
+        return mx.fast.scaled_dot_product_attention(
+            q_rot, k_all, v_all, scale=scale, mask="causal"
+        )
+
     # ── Token management ──────────────────────────────────────────────────────
 
     def trim(self, n: int) -> int:

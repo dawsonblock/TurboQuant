@@ -40,6 +40,7 @@ from turboquant.core.residual import (
     encode_topk_residual,
     decode_topk_residual,
 )
+from turboquant.kernels import decode_k_fused, decode_v_fused
 
 
 def _round_up(n: int, multiple: int) -> int:
@@ -168,19 +169,13 @@ class TurboQuantPipeline:
         """
         cfg = self.config
         d_head = self._d_head or 0
-        d_pad = self._d_pad or 0
-
-        y_hat = dequantize_groups(
-            packed_k, k_scales, cfg.k_bits, cfg.k_group_size, d_pad
+        return decode_k_fused(
+            packed_k, k_scales, resid_vals, resid_idx,
+            bits=cfg.k_bits,
+            group_size=cfg.k_group_size,
+            topk=cfg.residual_topk,
+            d_head=d_head,
         )
-
-        if cfg.residual_topk > 0 and resid_vals is not None:
-            residual = decode_topk_residual(
-                resid_vals, resid_idx, cfg.k_group_size
-            )
-            y_hat = y_hat + residual[..., :d_pad]
-
-        return y_hat[..., :d_head]
 
     # ── V encode / decode ─────────────────────────────────────────────────────
 
@@ -217,8 +212,11 @@ class TurboQuantPipeline:
         """Decode packed V → [..., v_dim]."""
         cfg = self.config
         v_dim = self._v_dim or 0
-        return dequantize_groups(
-            packed_v, v_scales, cfg.v_bits, cfg.v_group_size, v_dim
+        return decode_v_fused(
+            packed_v, v_scales,
+            bits=cfg.v_bits,
+            group_size=cfg.v_group_size,
+            d_head=v_dim,
         )
 
     # ── Query rotation helper (called by attention side) ─────────────────────

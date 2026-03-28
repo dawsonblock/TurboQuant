@@ -175,6 +175,16 @@ def turboquant_streaming_attention(
     # ``rotate_queries_for_attention`` is the canonical name; KVCompressor
     # also exposes ``rotate_queries`` as an alias.
     q_rot = cache.rotate_queries_for_attention(queries)
+
+    L_q = queries.shape[2]
+    if L_q == 1:
+        # Decode step fast path: bypass the streaming block loop.
+        # Decode the full K/V history in one kernel dispatch, then let
+        # mx.fast.scaled_dot_product_attention handle the matmul in Metal.
+        return cache.decode_all_and_attend(
+            q_rot, keys_view, scale=scale
+        ).astype(queries.dtype)
+
     return _streaming_softmax_attention(q_rot, keys_view, scale=scale).astype(
         queries.dtype
     )
