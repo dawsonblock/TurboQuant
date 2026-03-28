@@ -1,0 +1,238 @@
+Add the generate-level smoke test now.
+
+That is the right next patch because generate.py still owns the cache-upgrade path. The cache itself can work and Gemma can run, but you still need to verify the actual generation loop swaps a KVCache into TurboQuantKCache when the threshold is crossed.
+
+tests/test_turboquant_generate.py
+
+Use this scaffold:
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_lm.models import cache as cache_mod
+from mlx_lm.models.cache import KVCache, TurboQuantKCache
+from mlx_lm.generate import maybe_turboquant_k_cache
+
+
+class _DummyModel(nn.Module):
+    def __call__(self, x, cache=None):
+        # Minimal shape-compatible stub for smoke tests.
+        # Returns fake logits: [B, T, V]
+        b, t = x.shape
+        vocab = 16
+        return mx.zeros((b, t, vocab), dtype=mx.float32)
+
+
+def _make_dense_prompt_cache(offset=0):
+    c = KVCache()
+    if offset > 0:
+        # KVCache expects [B, H, T, D]
+        keys = mx.zeros((1, 2, offset, 8), dtype=mx.float32)
+        values = mx.zeros((1, 2, offset, 8), dtype=mx.float32)
+        c.update_and_fetch(keys, values)
+    return [c]
+
+
+def test_maybe_turboquant_k_cache_noop_when_threshold_is_none():
+    prompt_cache = _make_dense_prompt_cache(offset=8)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=None,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    assert isinstance(prompt_cache[0], KVCache)
+    assert not isinstance(prompt_cache[0], TurboQuantKCache)
+
+
+def test_maybe_turboquant_k_cache_noop_before_threshold():
+    prompt_cache = _make_dense_prompt_cache(offset=7)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=8,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    assert isinstance(prompt_cache[0], KVCache)
+    assert not isinstance(prompt_cache[0], TurboQuantKCache)
+
+
+def test_maybe_turboquant_k_cache_upgrades_at_threshold():
+    prompt_cache = _make_dense_prompt_cache(offset=8)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=8,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    assert isinstance(prompt_cache[0], TurboQuantKCache)
+    assert prompt_cache[0].offset == 8
+
+
+def test_maybe_turboquant_k_cache_preserves_offset_and_state_shape():
+    prompt_cache = _make_dense_prompt_cache(offset=5)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=5,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    c = prompt_cache[0]
+    assert isinstance(c, TurboQuantKCache)
+    assert c.offset == 5
+
+    state = c.state
+    assert state[0] is not None   # k_codes
+    assert state[5] is not None   # v_codes
+    assert state[6] is not None   # v_scales
+
+
+def test_maybe_turboquant_k_cache_is_idempotent_for_existing_tq_cache():
+    prompt_cache = _make_dense_prompt_cache(offset=6)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=6,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    first_obj = prompt_cache[0]
+    assert isinstance(first_obj, TurboQuantKCache)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=6,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    second_obj = prompt_cache[0]
+    assert isinstance(second_obj, TurboQuantKCache)
+    assert second_obj.offset == 6
+
+Update your helper in generate.py
+
+Make the helper accept the full argument set used in the tests.
+
+def maybe_turboquant_k_cache(
+    prompt_cache,
+    turboquant_k_start,
+    turboquant_main_bits,
+    turboquant_group_size,
+    turboquant_rotation,
+    turboquant_return_mode,
+    turboquant_resid_scale_bits,
+    turboquant_v_bits,
+    turboquant_v_group_size,
+    turboquant_v_enabled,
+):
+    if turboquant_k_start is None:
+        return
+
+    for e, c in enumerate(prompt_cache):
+        if isinstance(c, TurboQuantKCache):
+            continue
+
+        if hasattr(c, "to_turboquant") and c.offset >= turboquant_k_start:
+            prompt_cache[e] = c.to_turboquant(
+                main_bits=turboquant_main_bits,
+                group_size=turboquant_group_size,
+                rotation=turboquant_rotation,
+                return_mode=turboquant_return_mode,
+                resid_scale_bits=turboquant_resid_scale_bits,
+                v_bits=turboquant_v_bits,
+                v_group_size=turboquant_v_group_size,
+                v_enabled=turboquant_v_enabled,
+            )
+
+That isinstance(c, TurboQuantKCache) guard matters. Without it, repeated calls during generation can keep rebuilding the cache object.
+
+One extra test worth adding
+
+Add this after the helper tests:
+
+def test_turboquant_upgraded_cache_can_accept_more_tokens():
+    prompt_cache = _make_dense_prompt_cache(offset=4)
+
+    maybe_turboquant_k_cache(
+        prompt_cache,
+        turboquant_k_start=4,
+        turboquant_main_bits=3,
+        turboquant_group_size=8,
+        turboquant_rotation="identity",
+        turboquant_return_mode="view",
+        turboquant_resid_scale_bits=8,
+        turboquant_v_bits=4,
+        turboquant_v_group_size=8,
+        turboquant_v_enabled=True,
+    )
+
+    c = prompt_cache[0]
+    keys = mx.zeros((1, 2, 2, 8), dtype=mx.float32)
+    values = mx.zeros((1, 2, 2, 8), dtype=mx.float32)
+    c.update_and_fetch(keys, values)
+
+    assert c.offset == 6
+
+What this gives you
+
+After this file passes, you know three important things:
+	•	the upgrade hook works
+	•	the upgraded cache survives repeated calls
+	•	the upgraded cache can continue growing after conversion
+
+That is enough to justify a small end-to-end generation smoke run.
+
+Next step
+
+After this, add one minimal end-to-end generation test with Gemma and a very short prompt, only checking:
+	•	no crash
+	•	cache upgrades after threshold
+	•	output tensor shape stays valid
+
+Do not add quality assertions yet.
