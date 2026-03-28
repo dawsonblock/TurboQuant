@@ -114,15 +114,20 @@ class KVCompressor:
         new_cap = max(self._cap + step, need)
 
         from turboquant.core.quantizer import _round_up, _codes_per_word
-        k_d_pad = _round_up(D, cfg.k_group_size)
-        k_cpw   = _codes_per_word(cfg.k_bits)
-        k_nw    = k_d_pad // k_cpw
-        k_ng    = k_d_pad // cfg.k_group_size
+        # Two-phase padding matching quantize_groups:
+        #   Phase 1: round up to group boundary
+        #   Phase 2: round up to word-packing boundary
+        k_d_pad  = _round_up(D, cfg.k_group_size)
+        k_cpw    = _codes_per_word(cfg.k_bits)
+        k_d_pack = _round_up(k_d_pad, k_cpw)   # must be divisible by k_cpw
+        k_nw     = k_d_pack // k_cpw
+        k_ng     = k_d_pad // cfg.k_group_size
 
-        v_d_pad = _round_up(V, cfg.v_group_size)
-        v_cpw   = _codes_per_word(cfg.v_bits)
-        v_nw    = v_d_pad // v_cpw
-        v_ng    = v_d_pad // cfg.v_group_size
+        v_d_pad  = _round_up(V, cfg.v_group_size)
+        v_cpw    = _codes_per_word(cfg.v_bits)
+        v_d_pack = _round_up(v_d_pad, v_cpw)
+        v_nw     = v_d_pack // v_cpw
+        v_ng     = v_d_pad // cfg.v_group_size
 
         topk    = cfg.residual_topk
         s_dtype = mx.float16 if cfg.scale_dtype == "float16" else mx.bfloat16
@@ -240,6 +245,11 @@ class KVCompressor:
         """Rotate Q into the same coordinate frame as stored K."""
         return self.pipeline.rotate_queries(queries)
 
+    # Alias used by gemma.py streaming-attention helper.
+    def rotate_queries_for_attention(self, queries: mx.array) -> mx.array:
+        """Alias for :meth:`rotate_queries` — kept for model-layer compat."""
+        return self.rotate_queries(queries)
+
     def _make_view(self) -> TurboQuantKeysView:
         """Build a view covering the full stored history [0, offset)."""
         return TurboQuantKeysView(
@@ -295,6 +305,72 @@ class KVCompressor:
 
             yield s, e, k_blk, v_blk
 
+    # ── Token management ──────────────────────────────────────────────────────
+
+    def trim(self, n: int) -> int:
+        """Logically remove the last *n* tokens from the cache.
+
+        This adjusts ``offset`` only — the underlying storage is not
+        compacted.  Use this to roll back speculative decodes or to
+        implement a sliding-window over stored tokens.
+
+        Parameters
+        ----------
+        n:
+            Number of tokens to trim.  Clamped to ``[0, offset]``.
+
+        Returns
+        -------
+        int
+            The number of tokens actually trimmed (≤ *n*).
+        """
+        actual = min(max(n, 0), self.offset)
+        self.offset -= actual
+        return actual
+
+    def iter_blocks(
+        self,
+        block_tokens: Optional[int] = None,
+    ) -> Iterator[Tuple[int, int, mx.array, mx.array]]:
+        """Iterate over the full stored history in (K, V) blocks.
+
+        Equivalent to calling ``iter_rotated_kv_blocks`` with a view that
+        spans ``[0, offset)``.  Provided as a convenience so callers do
+        not need to construct a ``TurboQuantKeysView`` manually.
+
+        Yields
+        ------
+        (start, end, k_rotated, v)  — same contract as
+        ``iter_rotated_kv_blocks``.
+        """
+        view = self._make_view()
+        yield from self.iter_rotated_kv_blocks(view, block_tokens=block_tokens)
+
+    def memory_breakdown(self) -> dict:
+        """Return a breakdown of compressed buffer sizes in bytes.
+
+        Returns
+        -------
+        dict with keys:
+            ``k_packed``, ``k_scales``, ``resid_vals``, ``resid_idx``,
+            ``v_packed``, ``v_scales``, ``total``  (all in bytes).
+            Zero is reported for any buffer that has not been allocated.
+        """
+
+        def _nbytes(a) -> int:
+            return int(a.nbytes) if a is not None else 0
+
+        breakdown = {
+            "k_packed":   _nbytes(self._k_packed),
+            "k_scales":   _nbytes(self._k_scales),
+            "resid_vals": _nbytes(self._resid_vals),
+            "resid_idx":  _nbytes(self._resid_idx),
+            "v_packed":   _nbytes(self._v_packed),
+            "v_scales":   _nbytes(self._v_scales),
+        }
+        breakdown["total"] = sum(breakdown.values())
+        return breakdown
+
     # ── Debug helper (not in hot path) ───────────────────────────────────────
 
     def decode_k_full(self) -> mx.array:
@@ -319,7 +395,14 @@ class KVCompressor:
     # ── State serialisation ───────────────────────────────────────────────────
 
     def state(self) -> dict:
-        """Return a serialisable dict (values are numpy arrays)."""
+        """Return a serialisable dict (values are numpy arrays).
+
+        The dict always includes ``schema_version`` so that
+        :func:`turboquant.runtime.state.validate_state` can verify
+        compatibility before restoration.
+        """
+        from turboquant.runtime.state import STATE_SCHEMA_VERSION
+
         def _np(a):
             return np.array(a) if a is not None else None
 
@@ -329,6 +412,7 @@ class KVCompressor:
             return a[:, :, :n, ...] if a is not None else None
 
         s = {
+            "schema_version": STATE_SCHEMA_VERSION,
             "offset":     self.offset,
             "d_head":     self.pipeline._d_head,
             "d_pad":      self.pipeline._d_pad,
@@ -350,7 +434,15 @@ class KVCompressor:
         config: TurboQuantConfig,
         layer_id: int = 0,
     ) -> "KVCompressor":
-        """Restore a compressor from a state dict produced by ``state()``."""
+        """Restore a compressor from a state dict produced by ``state()``.
+
+        Calls :func:`turboquant.runtime.state.validate_state` before
+        restoring so that version mismatches are caught early with an
+        actionable error message.
+        """
+        from turboquant.runtime.state import validate_state
+        validate_state(state, config)
+
         obj = cls(config, layer_id)
         obj.offset = state["offset"]
 

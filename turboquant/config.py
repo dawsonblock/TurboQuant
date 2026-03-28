@@ -54,5 +54,30 @@ class TurboQuantConfig:
             raise ValueError(f"v_bits must be in [2, 8], got {self.v_bits}")
         if self.k_group_size < 1:
             raise ValueError(f"k_group_size must be >= 1, got {self.k_group_size}")
+        if self.v_group_size < 1:
+            raise ValueError(f"v_group_size must be >= 1, got {self.v_group_size}")
         if self.residual_topk < 0:
             raise ValueError(f"residual_topk must be >= 0, got {self.residual_topk}")
+        if self.block_tokens < 1:
+            raise ValueError(f"block_tokens must be >= 1, got {self.block_tokens}")
+        if self.allocation_step < 1:
+            raise ValueError(
+                f"allocation_step must be >= 1, got {self.allocation_step}"
+            )
+        _valid_rotations = ("identity", "hadamard", "random_orthogonal")
+        if self.rotation not in _valid_rotations:
+            raise ValueError(
+                f"rotation must be one of {_valid_rotations}, "
+                f"got {self.rotation!r}"
+            )
+        _valid_dtypes = ("float16", "bfloat16")
+        if self.scale_dtype not in _valid_dtypes:
+            raise ValueError(
+                f"scale_dtype must be one of {_valid_dtypes}, "
+                f"got {self.scale_dtype!r}"
+            )
+        if self.v_scale_dtype not in _valid_dtypes:
+            raise ValueError(
+                f"v_scale_dtype must be one of {_valid_dtypes}, "
+                f"got {self.v_scale_dtype!r}"
+            )
