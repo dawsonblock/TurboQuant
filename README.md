@@ -17,16 +17,16 @@
 
 ## What
 
-TurboQuant compresses the KV cache of transformer models running on Apple Silicon via [mlx-lm](https://github.com/ml-explore/mlx-lm). It cuts memory ~4× with no perceptible latency cost — the encode step is **3× faster** than a naive baseline.
+TurboQuant compresses the KV cache of transformer models running on Apple Silicon via [mlx-lm](https://github.com/ml-explore/mlx-lm). It cuts memory ~4× with no perceptible latency cost at typical decode lengths.
 
-> **⚠️ Current status:** This is a *serious prototype*, not a production system.
-> Gemma is the only wired architecture. Compression quality (perplexity impact) has **not** been measured at scale.
+> **⚠️ Current status:** Serious prototype. Gemma and Llama families are wired.
+> Compression quality (perplexity impact) has **not** been measured at scale.
 > No fused Metal kernel exists yet — the hot path runs in Python-level MLX.
 > Do not treat the memory/latency numbers as production benchmarks.
 
 ```
-Dense KV cache (fp16, 1K tokens, Gemma-2B)   1024 KB
-TurboQuant (3-bit K + 4-bit V)                ~252 KB   ▸ ~4× smaller
+Dense KV cache (fp16, 1K tokens, 2 heads, head_dim=128)   1024 KB
+TurboQuant (3-bit K + 4-bit V, group=64)                   ~252 KB   ▸ ~4× smaller
 ```
 
 | | Dense | TurboQuant |
@@ -34,7 +34,7 @@ TurboQuant (3-bit K + 4-bit V)                ~252 KB   ▸ ~4× smaller
 | K storage | fp16 | **3-bit** + per-group scale + sparse residual |
 | V storage | fp16 | **4-bit** + per-group scale |
 | 1K token footprint | 1024 KB | **~252 KB** |
-| Encode latency | 1.32 ms | **0.41 ms** (3.3×) |
+| Encode latency | ~1.3 ms | **~0.4 ms** (3×) |
 | Rotation | — | Hadamard (seeded, deterministic) |
 | Residual | — | Top-k sparse (k=2/group) |
 
@@ -72,7 +72,8 @@ Decode K (streaming attention)
 - **Hadamard whitening** — precomputed dense Hadamard matrix (built once at init, applied via `matmul`); orthogonal rotation equalises per-dimension variance, making per-group scalar quantisation nearly optimal. *Not* a fast butterfly transform — cost is O(d²) per token.
 - **Top-k sparse residual** — stores the k=2 largest-magnitude quantisation errors per group (fp16 value + uint8 index); recovers the dominant signal the main quantiser misses
 - **Two-phase bit-packing** — pad to group boundary, then to word boundary; handles any bit-width (including 3-bit) for any head-dim
-- **Single execution path** — no `return_mode` toggle, no dtype fallbacks; the config selects operations once at init
+- **Single execution path** — config selects operations once at init; no runtime branches.
+- **Versioned state schema** — `state()` dicts carry `schema_version: 1`; `validate_state()` enforces correctness on restore.
 
 ---
 
@@ -104,6 +105,21 @@ q_rot       = cache.rotate_queries(queries)          # rotate Q into K's frame
 for start, end, k_blk, v_blk in cache.iter_rotated_kv_blocks(view):
     # standard online-softmax attention over (q_rot, k_blk, v_blk)
     ...
+```
+
+### Wiring into mlx-lm generation
+
+```python
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.cache_upgrade import upgrade_cache_list
+from turboquant.config import TurboQuantConfig
+
+cache = make_prompt_cache(model)
+# ... run prefill ...
+
+cfg    = TurboQuantConfig(k_bits=3, k_group_size=64, rotation="hadamard")
+events = upgrade_cache_list(cache, k_start=64, config=cfg)
+# decode loop continues with TurboQuant cache
 ```
 
 ### Optional: offline calibration
@@ -150,21 +166,66 @@ cache = TurboQuantKCache(
 
 ```bash
 # Full suite — 70 tests in ~5 s
-python -m pytest turboquant/tests/ tests/ -v
+pytest tests/
 
-# Production package only (52 tests)
-python -m pytest turboquant/tests/ -v
+# Unit tests only  (turboquant package, 52 tests)
+pytest tests/unit/
 
-# Legacy integration only (18 tests)
-python -m pytest tests/ -v
+# Integration tests only  (mlx_lm + turboquant, 18 tests)
+pytest tests/integration/
 ```
+
+---
+
+## Benchmarks
 
 ```bash
-# Latency benchmark
+# Memory footprint table (bit-width × sequence length)
+python benchmarks/bench_memory_footprint.py
+
+# Encode latency: dense vs TurboQuant
+python benchmarks/bench_dense_vs_turboquant.py
+
+# Streaming attention throughput
+python benchmarks/bench_decode_streaming.py
+
+# Classic per-step latency
 python benchmarks/decode_latency.py
-# dequant mode   0.48 ms / step
-# view mode      0.38 ms / step
 ```
+
+Sample output from `bench_memory_footprint.py`:
+
+```
+type                      bits  group  tokens   total_MB   bytes/tok   vs_dense
+dense (float16)             16     --    1024       2.10        2048       1.0×
+TurboQuant k=3b g=64         3     64    1024       0.52         512       4.0×
+TurboQuant k=2b g=64         2     64    1024       0.43         416       4.9×
+```
+
+---
+
+## Evaluation
+
+```python
+from mlx_lm.models.cache import TurboQuantConfig
+from turboquant.eval import perplexity_report, drift_report, memory_report
+
+cfg = TurboQuantConfig(main_bits=3, group_size=64)
+
+# Perplexity delta vs dense
+ppl = perplexity_report(model, input_ids, turboquant_config=cfg)
+# → {'dense_ppl': 12.3, 'tq_ppl': 12.6, 'delta_ppl': 0.3, 'n_tokens': 63}
+
+# Logit-distribution KL divergence
+drift = drift_report(model, input_ids, turboquant_config=cfg)
+# → {'mean_kl': 0.004, 'max_kl': 0.021, 'n_tokens': 63}
+
+# Cache memory comparison
+mem = memory_report(model, input_ids, turboquant_config=cfg)
+# → {'dense_cache_bytes': 2097152, 'tq_cache_bytes': 524288, 'ratio': 4.0}
+```
+
+See [docs/evaluation.md](docs/evaluation.md) for interpretation guidance.
 
 ---
 
@@ -189,30 +250,49 @@ python benchmarks/decode_latency.py
 
 ```
 turboquant/
-├── config.py                 TurboQuantConfig — immutable, resolved at init
+├── config.py                  TurboQuantConfig — production schema
 ├── core/
-│   ├── rotation.py           FixedRotation (Hadamard · QR · identity)
-│   ├── quantizer.py          GroupScalarQuantizer + vectorised pack/unpack
-│   ├── residual.py           encode_topk_residual / decode_topk_residual
-│   └── pipeline.py           TurboQuantPipeline — single encode/decode path
+│   ├── rotation.py            FixedRotation (Hadamard / QR / identity)
+│   ├── quantizer.py           GroupScalarQuantizer + vectorised pack/unpack
+│   ├── residual.py            encode_topk_residual / decode_topk_residual
+│   └── pipeline.py            TurboQuantPipeline — single encode/decode path
 ├── runtime/
-│   ├── layout.py             ensure_layout [B, H, T, D]
-│   └── kv_interface.py       KVCompressor · TurboQuantKeysView
+│   ├── layout.py              ensure_layout [B, H, T, D]
+│   ├── kv_interface.py        KVCompressor + TurboQuantKeysView
+│   ├── attention.py           turboquant_streaming_attention (shared adapter)
+│   └── state.py               STATE_SCHEMA_VERSION + validate_state()
+├── eval/
+│   ├── perplexity.py          perplexity_from_logits(), perplexity_report()
+│   ├── generation_drift.py    logit_kl_divergence(), drift_report()
+│   └── memory.py              peak_memory_bytes(), memory_report()
 ├── calibration/
-│   └── fit_quantizer.py      calibrate() over any data iterator
-├── kernels/
-│   └── __init__.py           MLX/Metal dispatch note + shader roadmap
-├── tests/                    52 unit + integration tests
-└── config/default.json
+│   └── fit_quantizer.py       calibrate() over any data iterator
+└── kernels/
+    └── __init__.py            MLX/Metal dispatch note + shader roadmap
 
-mlx_lm/                       patched mlx-lm (legacy interface)
-├── models/cache.py           TurboQuantKCache (18 tests)
-├── models/gemma.py           streaming softmax attention
-└── generate.py               maybe_turboquant_k_cache hook
+mlx_lm/                        patched mlx-lm
+├── models/
+│   ├── cache.py               TurboQuantKCache adapter + KVCache helpers
+│   ├── gemma.py               wired → turboquant_streaming_attention
+│   └── llama.py               wired → turboquant_streaming_attention
+├── cache_upgrade.py           upgrade_cache_list() — canonical upgrade API
+└── generate.py                maybe_turboquant_k_cache (deprecated shim)
 
-tests/                        18 legacy integration tests
-benchmarks/decode_latency.py
-docs/design-notes.md
+tests/
+├── unit/                      52 turboquant package tests
+└── integration/               18 mlx_lm integration tests
+
+benchmarks/
+├── decode_latency.py
+├── bench_memory_footprint.py
+├── bench_dense_vs_turboquant.py
+└── bench_decode_streaming.py
+
+docs/
+├── architecture.md            component map, data-flow, memory model
+├── cache-format.md            state dict schema v1, packed uint32 layout
+├── integration.md             step-by-step model wiring guide
+└── evaluation.md              metrics, benchmark workflow, thresholds
 ```
 
 ---
@@ -221,25 +301,44 @@ docs/design-notes.md
 
 | Component | Status |
 |---|:---:|
-| `KVCompressor` | ✅ 52 / 52 tests |
+| `KVCompressor` | ✅ tests 52 / 52 |
 | `TurboQuantPipeline` | ✅ single path, no branches |
-| `FixedRotation` (Hadamard · QR · identity) | ✅ deterministic, save / load |
+| `FixedRotation` (Hadamard / QR / identity) | ✅ deterministic, save / load |
 | `GroupScalarQuantizer` + offline calibration | ✅ dynamic + calibrated |
 | Top-k sparse residual | ✅ per-group, configurable k |
 | Pure-MLX bit-packing | ✅ vectorised, no numpy sync |
-| `TurboQuantKCache` (legacy) | ✅ 18 / 18 tests |
-| Gemma streaming attention | ✅ working |
-| Other architectures | ⬜ needs per-arch patch |
+| Versioned state schema (`schema_version: 1`) | ✅ `validate_state()` enforced |
+| `TurboQuantKCache` adapter (legacy API) | ✅ tests 18 / 18 |
+| Shared streaming attention adapter | ✅ `turboquant.runtime.attention` |
+| Gemma streaming attention | ✅ wired |
+| Llama streaming attention | ✅ wired |
+| `upgrade_cache_list` cache upgrade API | ✅ canonical, idempotent |
+| Eval suite (perplexity / KL drift / memory) | ✅ `turboquant.eval` |
+| Benchmarks (memory / latency / streaming) | ✅ `benchmarks/` |
+| Architecture + integration docs | ✅ `docs/` |
+| Other architectures (Mistral, Phi, …) | ⬜ needs per-arch patch |
 | Fused Metal kernel (rotate + pack) | ⬜ see `turboquant/kernels/` |
-| Perplexity / quality benchmarks | ⚠️ not yet measured |
+| Perplexity / quality benchmarks at scale | ⬜ not yet measured |
 
 ---
 
 ## Limitations
 
-- **Quality unmeasured** — compression ratio is real; perplexity impact at scale has not been benchmarked. Don't assume 3-bit is sufficient for your use case without testing.
-- **Gemma only** — the streaming softmax attention branch is wired for Gemma. Other architectures need their own patch.
-- **No fused kernel yet** — the block iteration runs in Python. A Metal shader fusing rotation + pack would be the next real throughput win.
+- **Quality unmeasured** — compression ratio is real; perplexity impact at scale has not been benchmarked. Use `turboquant.eval.perplexity_report` and `drift_report` to measure on your data.
+- **Gemma + Llama wired** — `turboquant_streaming_attention` is dispatched in both. Adding a new architecture is a [one-function change](docs/integration.md#adding-a-new-model-family).
+- **No fused kernel yet** — the block iteration runs in Python-level MLX. A Metal shader fusing rotation + pack would be the next real throughput win.
+- **Hadamard is O(d²)** — not a fast butterfly transform. For very large head-dims, `rotation="identity"` is faster with marginally worse compression.
+
+---
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Component map, data-flow diagram, memory model |
+| [docs/cache-format.md](docs/cache-format.md) | State dict schema v1, uint32 packing layout |
+| [docs/integration.md](docs/integration.md) | Step-by-step wiring guide for new models |
+| [docs/evaluation.md](docs/evaluation.md) | Metrics reference, benchmark workflow, thresholds |
 
 ---
 
