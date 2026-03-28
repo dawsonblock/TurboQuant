@@ -1238,20 +1238,45 @@ class BatchRotatingKVCache(_BaseCache):
 
 
 # ---------------------------------------------------------------------------
-# TurboQuant KV cache
+# TurboQuant KV cache  (adapter over turboquant.runtime.kv_interface)
 # ---------------------------------------------------------------------------
+#
+# This section replaces the former ~700-line standalone TurboQuantKCache
+# implementation with a thin adapter that delegates all compression work to
+# KVCompressor from the turboquant package.
+#
+# Public API preserved for backward compatibility:
+#   - TurboQuantConfig   (legacy field names: main_bits, group_size, ...)
+#   - TurboQuantKeysView (re-exported from production package)
+#   - TurboQuantKCache   (adapter; same attribute surface as the old class)
+# ---------------------------------------------------------------------------
+
+# Re-export the canonical view/compressor from the production package.
+# gemma.py and tests import TurboQuantKeysView from .cache (this module).
+from turboquant.runtime.kv_interface import (
+    TurboQuantKeysView,
+    KVCompressor as _KVCompressor,
+)
+from turboquant.config import TurboQuantConfig as _ProdTurboQuantConfig
 
 
 @dataclass
 class TurboQuantConfig:
+    """Legacy TurboQuant config shim that maps old mlx-lm field names to the
+    production :class:`turboquant.config.TurboQuantConfig`.
+
+    Fields kept verbatim for backward compatibility with existing callers,
+    serialised checkpoints, and test fixtures.
+    """
+
     main_bits: int = 3
     group_size: int = 64
-    rotation: str = "identity"  # "identity" | "hadamard"
-    residual: str = "group_proj"
-    return_mode: str = "dequant"  # "dequant" | "view"
+    rotation: str = "identity"       # "identity" | "hadamard" | "random_orthogonal"
+    residual: str = "group_proj"     # legacy; ignored in production path
+    return_mode: str = "dequant"     # "dequant" | "view"
     block_tokens: int = 256
     scale_dtype: str = "float16"
-    resid_scale_bits: int = 8
+    resid_scale_bits: int = 8        # legacy; ignored in production path
     v_bits: int = 4
     v_group_size: int = 64
     v_scale_dtype: str = "float16"
@@ -1259,262 +1284,169 @@ class TurboQuantConfig:
     eps: float = 1e-6
 
 
-@dataclass
-class TurboQuantKeysView:
-    cache: "TurboQuantKCache"
-    start: int
-    end: int
-    d_head: int
-    block_tokens: int
+def _to_prod_config(cfg: TurboQuantConfig) -> _ProdTurboQuantConfig:
+    """Map legacy TurboQuantConfig field names to the production dataclass."""
+    return _ProdTurboQuantConfig(
+        k_bits=cfg.main_bits,
+        k_group_size=cfg.group_size,
+        v_bits=cfg.v_bits,
+        v_group_size=cfg.v_group_size,
+        v_enabled=cfg.v_enabled,
+        rotation=cfg.rotation,
+        residual_topk=0,   # legacy used sign-sketch; production uses top-k -> disable
+        block_tokens=cfg.block_tokens,
+        scale_dtype=cfg.scale_dtype,
+        v_scale_dtype=cfg.v_scale_dtype,
+        eps=cfg.eps,
+    )
 
 
 class TurboQuantKCache(_BaseCache):
-    """
-    Prototype TurboQuant-style KV cache for MLX-LM.
+    """Thin adapter: preserves the legacy TurboQuantKCache API while
+    delegating all compression/rotation/bit-packing to KVCompressor.
 
-    K: rotated, low-bit quantized, projected residual sketch.
-    V: low-bit quantized, no residual correction.
-
-    Returns either dense tensors (return_mode="dequant") or a
-    TurboQuantKeysView for block-streaming causal attention
-    (return_mode="view").
+    Preserved public attributes (required by tests and callers):
+        offset, k_codes, k_scales, v_codes, v_scales,
+        state (property), meta_state (property),
+        from_state (classmethod, 2-arg legacy signature),
+        update_and_fetch, iter_rotated_kv_blocks,
+        rotate_queries_for_attention, trim, is_trimmable,
+        size, nbytes, storage_breakdown, config.block_tokens
     """
 
     step = 512
 
-    def __init__(self, config: Optional[TurboQuantConfig] = None):
+    def __init__(self, config: Optional[TurboQuantConfig] = None) -> None:
         self.config = config or TurboQuantConfig()
-
-        # K compressed storage
-        self.k_codes = None
-        self.k_scales = None
-        self.k_resid_scale_q = None
-        self.k_resid_scale_max = None
-        self.k_resid_proj_signs = None
-
-        # V compressed storage
-        self.v_codes = None
-        self.v_scales = None
-
-        # metadata
-        self.offset = 0
-        self._d_head = None
-        self._d_pad = None
-        self._n_groups = None
-        self._value_dim = None
-        self._v_pad = None
-        self._v_groups = None
-        self._dtype_name = None
-        self._rotation_cache = {}
-        self._array_cache: dict = {}  # cached shift/mask mx.arrays
+        self._return_mode: str = self.config.return_mode
+        self._impl = _KVCompressor(_to_prod_config(self.config))
 
     # ------------------------------------------------------------------
-    # _BaseCache API
+    # _BaseCache size API
     # ------------------------------------------------------------------
 
-    def size(self):
-        return self.offset
+    def size(self) -> int:
+        return self._impl.offset
 
-    def __len__(self):
-        return self.offset
+    def __len__(self) -> int:
+        return self._impl.offset
 
-    def empty(self):
-        return self.k_codes is None
+    def empty(self) -> bool:
+        return self._impl._k_packed is None
 
-    def is_trimmable(self):
+    def is_trimmable(self) -> bool:
         return True
 
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        return n
+    def trim(self, n: int) -> int:
+        return self._impl.trim(n)
 
     def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
-
-    @property
-    def nbytes(self):
-        total = 0
-        for x in (
-            self.k_codes, self.k_scales, self.k_resid_scale_q,
-            self.k_resid_scale_max, self.k_resid_proj_signs,
-            self.v_codes, self.v_scales,
-        ):
-            if x is not None:
-                total += x.nbytes
-        return total
-
-    def storage_breakdown(self):
-        return {
-            "k_codes":           0 if self.k_codes           is None else self.k_codes.nbytes,
-            "k_scales":          0 if self.k_scales          is None else self.k_scales.nbytes,
-            "k_resid_scale_q":   0 if self.k_resid_scale_q   is None else self.k_resid_scale_q.nbytes,
-            "k_resid_scale_max": 0 if self.k_resid_scale_max is None else self.k_resid_scale_max.nbytes,
-            "k_resid_proj_signs":0 if self.k_resid_proj_signs is None else self.k_resid_proj_signs.nbytes,
-            "v_codes":           0 if self.v_codes           is None else self.v_codes.nbytes,
-            "v_scales":          0 if self.v_scales          is None else self.v_scales.nbytes,
-            "total":             self.nbytes,
-        }
-
-    @property
-    def state(self):
-        if self.k_codes is None:
-            return (None, None, None, None, None, None, None)
-        t = self.offset
-        if t == self.k_codes.shape[2]:
-            return (
-                self.k_codes, self.k_scales, self.k_resid_scale_q,
-                self.k_resid_scale_max, self.k_resid_proj_signs,
-                self.v_codes, self.v_scales,
-            )
-        return (
-            self.k_codes[..., :t, :],
-            self.k_scales[..., :t, :],
-            self.k_resid_scale_q[..., :t, :],
-            self.k_resid_scale_max[..., :t, :],
-            self.k_resid_proj_signs[..., :t, :],
-            self.v_codes[..., :t, :],
-            self.v_scales[..., :t, :],
-        )
-
-    @state.setter
-    def state(self, v):
-        (
-            self.k_codes, self.k_scales, self.k_resid_scale_q,
-            self.k_resid_scale_max, self.k_resid_proj_signs,
-            self.v_codes, self.v_scales,
-        ) = v
-        if self.k_codes is None:
-            self.offset = 0
-        else:
-            self.offset = self.k_codes.shape[2]
-
-    @property
-    def meta_state(self):
-        if self._d_head is None:
-            return ("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
-        return (
-            str(self.offset),
-            str(self._d_head),
-            str(self._d_pad),
-            str(self._value_dim),
-            str(self._v_pad),
-            self._dtype_name or "",
-            str(self.config.main_bits),
-            str(self.config.group_size),
-            self.config.rotation,
-            self.config.return_mode,
-            self.config.scale_dtype,
-            str(self.config.resid_scale_bits),
-            str(self.config.v_bits),
-            str(self.config.v_group_size),
-            self.config.v_scale_dtype,
-            "1" if self.config.v_enabled else "0",
-            str(self.config.block_tokens),
-        )
-
-    @meta_state.setter
-    def meta_state(self, v):
-        (
-            offset, d_head, d_pad, value_dim, v_pad, dtype_name,
-            main_bits, group_size, rotation, return_mode, scale_dtype,
-            resid_scale_bits, v_bits, v_group_size, v_scale_dtype, v_enabled,
-            block_tokens,
-        ) = v
-        self.offset    = int(offset)    if offset    else 0
-        self._d_head   = int(d_head)    if d_head    else None
-        self._d_pad    = int(d_pad)     if d_pad     else None
-        self._value_dim = int(value_dim) if value_dim else None
-        self._v_pad    = int(v_pad)     if v_pad     else None
-        self._dtype_name = dtype_name or None
-        self.config = TurboQuantConfig(
-            main_bits=int(main_bits)             if main_bits      else 3,
-            group_size=int(group_size)           if group_size     else 64,
-            rotation=rotation                    or "identity",
-            return_mode=return_mode              or "dequant",
-            scale_dtype=scale_dtype              or "float16",
-            resid_scale_bits=int(resid_scale_bits) if resid_scale_bits else 8,
-            v_bits=int(v_bits)                   if v_bits         else 4,
-            v_group_size=int(v_group_size)       if v_group_size   else 64,
-            v_scale_dtype=v_scale_dtype          or "float16",
-            v_enabled=(v_enabled == "1"),
-            block_tokens=int(block_tokens)       if block_tokens   else 256,
-        )
-        if self._d_pad is not None:
-            self._n_groups = self._d_pad // self.config.group_size
-        if self._v_pad is not None:
-            self._v_groups = self._v_pad // self.config.v_group_size
-
-    @classmethod
-    def from_state(cls, state, meta_state):
-        obj = cls.__new__(cls)
-        obj._rotation_cache = {}
-        obj.state = state
-        obj.meta_state = meta_state
-        return obj
+        return create_attention_mask(*args, offset=self._impl.offset, **kwargs)
 
     # ------------------------------------------------------------------
-    # Main public method
+    # offset
+    # ------------------------------------------------------------------
+
+    @property
+    def offset(self) -> int:
+        return self._impl.offset
+
+    @offset.setter
+    def offset(self, v: int) -> None:
+        self._impl.offset = v
+
+    # ------------------------------------------------------------------
+    # Memory
+    # ------------------------------------------------------------------
+
+    @property
+    def nbytes(self) -> int:
+        return self._impl.memory_breakdown()["total"]
+
+    def storage_breakdown(self) -> dict:
+        bd = self._impl.memory_breakdown()
+        return {
+            "k_codes":            bd.get("k_packed", 0),
+            "k_scales":           bd.get("k_scales", 0),
+            "k_resid_scale_q":    0,
+            "k_resid_scale_max":  0,
+            "k_resid_proj_signs": 0,
+            "v_codes":            bd.get("v_packed", 0),
+            "v_scales":           bd.get("v_scales", 0),
+            "total":              bd.get("total", 0),
+        }
+
+    # ------------------------------------------------------------------
+    # Buffer access (for tests that inspect k_codes, k_scales, ...)
+    # ------------------------------------------------------------------
+
+    @property
+    def k_codes(self):
+        """Packed 3/4-bit K codes -- [B, H, T, n_words] uint32."""
+        return self._impl._k_packed
+
+    @property
+    def k_scales(self):
+        """Per-group K scales -- [B, H, T, n_groups]."""
+        return self._impl._k_scales
+
+    @property
+    def k_resid_scale_q(self):
+        """Legacy field -- not present in production path; always None."""
+        return None
+
+    @property
+    def k_resid_scale_max(self):
+        """Legacy field -- not present in production path; always None."""
+        return None
+
+    @property
+    def k_resid_proj_signs(self):
+        """Legacy field -- not present in production path; always None."""
+        return None
+
+    @property
+    def v_codes(self):
+        """Packed V codes -- [B, H, T, n_words] uint32."""
+        return self._impl._v_packed
+
+    @property
+    def v_scales(self):
+        """Per-group V scales -- [B, H, T, n_groups]."""
+        return self._impl._v_scales
+
+    # ------------------------------------------------------------------
+    # Main cache API
     # ------------------------------------------------------------------
 
     def update_and_fetch(self, keys, values):
-        """keys/values: [B, H, T, D]. Returns (k_out, v_out)."""
-        B, H, T, D = keys.shape
-        prev = self.offset
+        """Compress and store keys/values; return (k_out, v_out).
 
-        self._ensure_capacity(
-            B=B, H=H, t_new=T,
-            d_head=D, v_head_dim=values.shape[-1], dtype=keys.dtype,
-        )
+        return_mode="view"   -> k_out is a TurboQuantKeysView (lazy).
+        return_mode="dequant" -> k_out is a dense reconstructed tensor.
+        """
+        view, _ = self._impl.update_and_fetch(keys, values)
 
-        y = self._rotate(keys)
-        y_pad = self._pad_last_dim(y, self._d_pad)
+        if self._return_mode == "view":
+            return view, values
 
-        packed_codes, scales, resid_scale_q, resid_scale_max, resid_proj_signs = \
-            self._encode_k(y_pad)
+        # dequant mode: decode the full K history
+        k_dense = self._impl.decode_k_full()
 
-        self.k_codes[..., prev:prev + T, :]           = packed_codes
-        self.k_scales[..., prev:prev + T, :]          = scales
-        self.k_resid_scale_q[..., prev:prev + T, :]   = resid_scale_q
-        self.k_resid_scale_max[..., prev:prev + T, :] = resid_scale_max
-        self.k_resid_proj_signs[..., prev:prev + T, :] = resid_proj_signs
+        if self.config.v_enabled and self._impl._v_packed is not None:
+            impl_view = self._impl._make_view()
+            v_blocks = [
+                vb
+                for _, _, _, vb in self._impl.iter_rotated_kv_blocks(impl_view)
+            ]
+            v_dense = mx.concatenate(v_blocks, axis=2).astype(values.dtype)
+        else:
+            v_dense = values
 
-        if self.config.v_enabled:
-            v_codes, v_scales = self._encode_v(values)
-            self.v_codes[..., prev:prev + T, :]  = v_codes
-            self.v_scales[..., prev:prev + T, :] = v_scales
-
-        self.offset += T
-
-        if self.config.return_mode == "view":
-            # Return the current-step values unchanged; streaming attention
-            # decodes V per block via iter_rotated_kv_blocks — no need to
-            # decode the full history here.
-            return self._make_view(), values
-
-        k_recon = self._decode_k_slice(0, self.offset)
-        v_out = self._decode_v_slice(0, self.offset, values.dtype) \
-            if self.config.v_enabled else values
-        return k_recon, v_out
-
-    # ------------------------------------------------------------------
-    # Specialisation helpers
-    # ------------------------------------------------------------------
-
-    def _make_view(self):
-        return TurboQuantKeysView(
-            cache=self,
-            start=0,
-            end=self.offset,
-            d_head=self._d_head,
-            block_tokens=self.config.block_tokens,
-        )
+        return k_dense, v_dense
 
     def rotate_queries_for_attention(self, queries: mx.array) -> mx.array:
-        return self._rotate(queries)
-
-    def decode_rotated_k_block(self, start: int, end: int) -> mx.array:
-        return self._decode_rotated_k_slice(start, end)
+        return self._impl.rotate_queries_for_attention(queries)
 
     def iter_rotated_kv_blocks(
         self,
@@ -1522,434 +1454,154 @@ class TurboQuantKCache(_BaseCache):
         values_unused=None,
         block_tokens: Optional[int] = None,
     ):
-        blk = block_tokens or view.block_tokens or self.config.block_tokens
-        for s in range(view.start, view.end, blk):
-            e = min(s + blk, view.end)
-            k_rot = self.decode_rotated_k_block(s, e)
-            if self.config.v_enabled:
-                v_blk = self._decode_v_slice(s, e, k_rot.dtype)
-            else:
-                v_blk = mx.zeros(
-                    (*k_rot.shape[:-1], self._value_dim or k_rot.shape[-1]),
-                    dtype=k_rot.dtype,
-                )
-            yield s, e, k_rot, v_blk
+        """Yield (start, end, k_rotated, v_block) for streaming attention."""
+        yield from self._impl.iter_rotated_kv_blocks(view, block_tokens=block_tokens)
 
     # ------------------------------------------------------------------
-    # Allocation
+    # State serialisation
     # ------------------------------------------------------------------
 
-    def _ensure_capacity(self, *, B, H, t_new, d_head, v_head_dim, dtype):
-        if self._d_head is None:
-            self._d_head    = d_head
-            self._d_pad     = self._round_up(d_head, self.config.group_size)
-            self._n_groups  = self._d_pad // self.config.group_size
-            self._value_dim = v_head_dim
-            self._v_pad     = self._round_up(v_head_dim, self.config.v_group_size)
-            self._v_groups  = self._v_pad // self.config.v_group_size
-            self._dtype_name = str(dtype)
+    @property
+    def state(self):
+        """7-tuple of MLX arrays for backward-compatible state roundtrip.
 
-        prev = self.offset
-        need = prev + t_new
-        if self.k_codes is not None and need <= self.k_codes.shape[2]:
-            return
+        Residual fields (indices 2-4) are always None -- the production path
+        uses top-k sparse residuals stored inside KVCompressor, not the legacy
+        sign-sketch arrays.
+        """
+        impl = self._impl
+        if impl._k_packed is None:
+            return (None, None, None, None, None, None, None)
 
-        n_steps  = (t_new + self.step - 1) // self.step
-        new_cap  = n_steps * self.step
+        T = impl.offset
 
-        sd  = self._scale_dtype(dtype)
-        vsd = self._v_scale_dtype(dtype)
+        def _crop(a):
+            if a is None:
+                return None
+            return a[:, :, :T, ...] if a.shape[2] > T else a
 
-        new_k_codes   = mx.zeros((B, H, new_cap, self._packed_code_words(self._d_pad)),  dtype=mx.uint32)
-        new_k_scales  = mx.zeros((B, H, new_cap, self._n_groups),                        dtype=sd)
-        new_k_rsq     = mx.zeros((B, H, new_cap, self._n_groups),                        dtype=mx.uint8)
-        new_k_rsmax   = mx.zeros((B, H, new_cap, 1),                                     dtype=sd)
-        new_k_rssigns = mx.zeros((B, H, new_cap, (self._n_groups + 7) // 8),             dtype=mx.uint8)
-        new_v_codes   = mx.zeros((B, H, new_cap, self._packed_v_words(self._v_pad)),     dtype=mx.uint32)
-        new_v_scales  = mx.zeros((B, H, new_cap, self._v_groups),                        dtype=vsd)
-
-        if self.k_codes is None:
-            self.k_codes          = new_k_codes
-            self.k_scales         = new_k_scales
-            self.k_resid_scale_q  = new_k_rsq
-            self.k_resid_scale_max = new_k_rsmax
-            self.k_resid_proj_signs = new_k_rssigns
-            self.v_codes          = new_v_codes
-            self.v_scales         = new_v_scales
-            return
-
-        if prev % self.step != 0:
-            self.k_codes          = self.k_codes[..., :prev, :]
-            self.k_scales         = self.k_scales[..., :prev, :]
-            self.k_resid_scale_q  = self.k_resid_scale_q[..., :prev, :]
-            self.k_resid_scale_max = self.k_resid_scale_max[..., :prev, :]
-            self.k_resid_proj_signs = self.k_resid_proj_signs[..., :prev, :]
-            self.v_codes          = self.v_codes[..., :prev, :]
-            self.v_scales         = self.v_scales[..., :prev, :]
-
-        self.k_codes          = mx.concatenate([self.k_codes,          new_k_codes],   axis=2)
-        self.k_scales         = mx.concatenate([self.k_scales,         new_k_scales],  axis=2)
-        self.k_resid_scale_q  = mx.concatenate([self.k_resid_scale_q,  new_k_rsq],     axis=2)
-        self.k_resid_scale_max = mx.concatenate([self.k_resid_scale_max, new_k_rsmax], axis=2)
-        self.k_resid_proj_signs = mx.concatenate([self.k_resid_proj_signs, new_k_rssigns], axis=2)
-        self.v_codes          = mx.concatenate([self.v_codes,          new_v_codes],   axis=2)
-        self.v_scales         = mx.concatenate([self.v_scales,         new_v_scales],  axis=2)
-
-    # ------------------------------------------------------------------
-    # K encode / decode
-    # ------------------------------------------------------------------
-
-    def _encode_k(self, y_pad):
-        B, H, T, Dp = y_pad.shape
-        G = self.config.group_size
-        n_groups = Dp // G
-
-        yg = y_pad.reshape(B, H, T, n_groups, G)
-        qmax = max(1, (1 << (self.config.main_bits - 1)) - 1)
-
-        scales_fp = mx.maximum(
-            mx.max(mx.abs(yg), axis=-1),
-            mx.array(self.config.eps, dtype=y_pad.dtype),
-        ) / qmax
-        scales_e = scales_fp[..., None]
-
-        q = mx.round(yg / scales_e)
-        q = mx.clip(q, -qmax, qmax)
-        q_i32 = q.astype(mx.int32)
-
-        codes_dense  = (q_i32 + qmax).astype(mx.uint8).reshape(B, H, T, Dp)
-        packed_codes = self._pack_main_codes(codes_dense)
-
-        y_hat  = (q.astype(y_pad.dtype) * scales_e).reshape(B, H, T, Dp)
-        resid  = y_pad - y_hat
-        resid_g = resid.reshape(B, H, T, n_groups, G)
-
-        basis     = self._get_group_basis(G, y_pad.dtype).reshape(1, 1, 1, 1, G)
-        proj      = mx.sum(resid_g * basis, axis=-1)
-        proj_signs   = proj >= 0
-        proj_scale_fp = mx.abs(proj) / G
-
-        scales = self._cast_scale_out(scales_fp, y_pad.dtype)
-        resid_scale_q, resid_scale_max = self._quantize_resid_proj_scale(
-            proj_scale_fp, y_pad.dtype
+        return (
+            _crop(impl._k_packed),
+            _crop(impl._k_scales),
+            None,   # k_resid_scale_q   (sign-sketch; not used in production)
+            None,   # k_resid_scale_max
+            None,   # k_resid_proj_signs
+            _crop(impl._v_packed),
+            _crop(impl._v_scales),
         )
-        resid_proj_signs = self._pack_group_sign_bits(proj_signs)
 
-        return packed_codes, scales, resid_scale_q, resid_scale_max, resid_proj_signs
+    @state.setter
+    def state(self, v):
+        k_codes, k_scales, _rsq, _rsmax, _rssigns, v_codes, v_scales = v
+        impl = self._impl
+        impl._k_packed = k_codes
+        impl._k_scales = k_scales
+        impl._v_packed = v_codes
+        impl._v_scales = v_scales
+        if k_codes is not None:
+            impl.offset = k_codes.shape[2]
+            impl._cap   = k_codes.shape[2]
+            impl._B     = k_codes.shape[0]
+            impl._H     = k_codes.shape[1]
+        else:
+            impl.offset = 0
 
-    def _decode_rotated_k_slice(self, start: int, end: int):
-        packed          = self.k_codes[..., start:end, :]
-        scales          = self._cast_scale_in(self.k_scales[..., start:end, :], mx.float32)
-        resid_scale_q   = self.k_resid_scale_q[..., start:end, :]
-        resid_scale_max = self.k_resid_scale_max[..., start:end, :]
-        resid_proj_scale = self._dequantize_resid_proj_scale(
-            resid_scale_q, resid_scale_max, mx.float32
+    @property
+    def meta_state(self):
+        """17-tuple of strings for backward-compatible state roundtrip."""
+        impl = self._impl
+        pipeline = impl.pipeline
+        d_head = getattr(pipeline, "_d_head", None)
+        d_pad  = getattr(pipeline, "_d_pad",  None)
+        v_dim  = getattr(pipeline, "_v_dim",  None)
+        v_pad  = getattr(pipeline, "_v_pad",  None)
+        cfg    = self.config
+
+        if d_head is None:
+            return ("",) * 17
+
+        return (
+            str(impl.offset),
+            str(d_head),
+            str(d_pad  if d_pad  is not None else ""),
+            str(v_dim  if v_dim  is not None else ""),
+            str(v_pad  if v_pad  is not None else ""),
+            str(getattr(impl, "_dtype", None) or ""),
+            str(cfg.main_bits),
+            str(cfg.group_size),
+            cfg.rotation,
+            cfg.return_mode,
+            cfg.scale_dtype,
+            str(cfg.resid_scale_bits),
+            str(cfg.v_bits),
+            str(cfg.v_group_size),
+            cfg.v_scale_dtype,
+            "1" if cfg.v_enabled else "0",
+            str(cfg.block_tokens),
         )
-        resid_proj_signs = self.k_resid_proj_signs[..., start:end, :]
 
-        codes = self._unpack_main_codes(packed, self._d_pad)
-        B, H, T, Dp = codes.shape
-        G        = self.config.group_size
-        n_groups = Dp // G
-        qmax     = max(1, (1 << (self.config.main_bits - 1)) - 1)
+    @meta_state.setter
+    def meta_state(self, v):
+        (
+            offset, d_head, d_pad, value_dim, v_pad, dtype_name,
+            main_bits, group_size, rotation, return_mode, scale_dtype,
+            resid_scale_bits, v_bits, v_group_size, v_scale_dtype,
+            v_enabled, block_tokens,
+        ) = v
+        impl = self._impl
+        pipeline = impl.pipeline
+        pipeline._d_head = int(d_head)    if d_head    else None
+        pipeline._d_pad  = int(d_pad)     if d_pad     else None
+        pipeline._v_dim  = int(value_dim) if value_dim else None
+        pipeline._v_pad  = int(v_pad)     if v_pad     else None
+        impl.offset      = int(offset)    if offset    else 0
+        impl._dtype      = dtype_name or None
 
-        q = codes.astype(mx.int32) - qmax
-        q = q.reshape(B, H, T, n_groups, G).astype(mx.float32)
-        y_hat = q * scales[..., None]
+        self.config = TurboQuantConfig(
+            main_bits        = int(main_bits)          if main_bits        else 3,
+            group_size       = int(group_size)         if group_size       else 64,
+            rotation         = rotation                or "identity",
+            return_mode      = return_mode             or "dequant",
+            scale_dtype      = scale_dtype             or "float16",
+            resid_scale_bits = int(resid_scale_bits)   if resid_scale_bits else 8,
+            v_bits           = int(v_bits)             if v_bits           else 4,
+            v_group_size     = int(v_group_size)       if v_group_size     else 64,
+            v_scale_dtype    = v_scale_dtype           or "float16",
+            v_enabled        = (v_enabled == "1"),
+            block_tokens     = int(block_tokens)       if block_tokens     else 256,
+        )
+        self._return_mode = self.config.return_mode
 
-        proj_sign = self._unpack_group_sign_bits(resid_proj_signs, n_groups).astype(mx.float32)
-        # Fuse sign direction + scale into one [B,H,T,n_groups] tensor before
-        # expanding dims, saving a 5-D intermediate allocation.
-        sign_scale = (proj_sign * 2.0 - 1.0) * resid_proj_scale
+    @classmethod
+    def from_state(cls, state, meta_state):
+        """Restore from (state, meta_state) -- 2-arg legacy classmethod."""
+        (
+            offset, d_head, d_pad, value_dim, v_pad, dtype_name,
+            main_bits, group_size, rotation, return_mode, scale_dtype,
+            resid_scale_bits, v_bits, v_group_size, v_scale_dtype,
+            v_enabled, block_tokens,
+        ) = meta_state
 
-        basis = self._get_group_basis(G, mx.float32).reshape(1, 1, 1, 1, G)
-        y = (y_hat + sign_scale[..., None] * basis).reshape(B, H, T, Dp)
-        return y[..., : self._d_head]
-
-    def _decode_k_slice(self, start: int, end: int):
-        y = self._decode_rotated_k_slice(start, end)
-        return self._inverse_rotate(y)
-
-    # ------------------------------------------------------------------
-    # V encode / decode
-    # ------------------------------------------------------------------
-
-    def _encode_v(self, values: mx.array):
-        B, H, T, Dv = values.shape
-        if Dv < self._v_pad:
-            values = self._pad_last_dim(values, self._v_pad)
-
-        vg   = values.reshape(B, H, T, self._v_groups, self.config.v_group_size)
-        qmax = max(1, (1 << (self.config.v_bits - 1)) - 1)
-
-        scales_fp = mx.maximum(
-            mx.max(mx.abs(vg), axis=-1),
-            mx.array(self.config.eps, dtype=values.dtype),
-        ) / qmax
-        scales_e = scales_fp[..., None]
-
-        q     = mx.round(vg / scales_e)
-        q     = mx.clip(q, -qmax, qmax)
-        q_i32 = q.astype(mx.int32)
-
-        codes_dense  = (q_i32 + qmax).astype(mx.uint8).reshape(B, H, T, self._v_pad)
-        packed_codes = self._pack_v_codes(codes_dense)
-        scales       = scales_fp.astype(self._v_scale_dtype(values.dtype))
-        return packed_codes, scales
-
-    def _decode_v_slice(self, start: int, end: int, compute_dtype):
-        packed = self.v_codes[..., start:end, :]
-        scales = self.v_scales[..., start:end, :]
-        if scales.dtype != compute_dtype:
-            scales = scales.astype(compute_dtype)
-
-        codes = self._unpack_v_codes(packed, self._v_pad)
-        B, H, T, Vp = codes.shape
-        qmax = max(1, (1 << (self.config.v_bits - 1)) - 1)
-
-        q     = codes.astype(mx.int32) - qmax
-        q     = q.reshape(B, H, T, self._v_groups, self.config.v_group_size).astype(compute_dtype)
-        v_hat = q * scales[..., None]
-        v_hat = v_hat.reshape(B, H, T, Vp)
-        return v_hat[..., : self._value_dim]
-
-    # ------------------------------------------------------------------
-    # Rotation
-    # ------------------------------------------------------------------
-
-    def _rotate(self, x):
-        if self.config.rotation == "identity":
-            return x
-        R = self._get_rotation(x.shape[-1], x.dtype)
-        return mx.matmul(x, R)
-
-    def _inverse_rotate(self, x):
-        if self.config.rotation == "identity":
-            return x
-        R = self._get_rotation(x.shape[-1], x.dtype)
-        # Use R.T so that inverse_rotate(rotate(x)) == x for orthogonal R.
-        return mx.matmul(x, R.T)
-
-    def _get_rotation(self, d_head: int, dtype):
-        key = ("rot", d_head, str(dtype), self.config.rotation)
-        if key in self._rotation_cache:
-            return self._rotation_cache[key]
-        if self.config.rotation == "identity":
-            R = mx.eye(d_head, dtype=dtype)
-        elif self.config.rotation == "hadamard":
-            if not self._is_power_of_two(d_head):
-                R = mx.eye(d_head, dtype=dtype)
-            else:
-                R = self._hadamard(d_head, dtype)
-        else:
-            raise ValueError(f"Unsupported rotation: {self.config.rotation}")
-        self._rotation_cache[key] = R
-        return R
-
-    def _hadamard(self, n: int, dtype):
-        H = mx.array([[1.0]], dtype=dtype)
-        while H.shape[0] < n:
-            top    = mx.concatenate([H,  H], axis=1)
-            bottom = mx.concatenate([H, -H], axis=1)
-            H = mx.concatenate([top, bottom], axis=0)
-        return H / mx.sqrt(mx.array(float(n), dtype=dtype))
-
-    def _get_group_basis(self, group_size: int, dtype):
-        key = ("basis", group_size, str(dtype))
-        if key in self._rotation_cache:
-            return self._rotation_cache[key]
-        rng   = np.random.default_rng(0)
-        basis = rng.choice([-1.0, 1.0], size=(group_size,), replace=True).astype(np.float32)
-        basis = mx.array(basis, dtype=dtype)
-        self._rotation_cache[key] = basis
-        return basis
-
-    # ------------------------------------------------------------------
-    # Quantisation helpers
-    # ------------------------------------------------------------------
-
-    def _scale_dtype(self, model_dtype):
-        if self.config.scale_dtype == "float16":  return mx.float16
-        if self.config.scale_dtype == "bfloat16": return mx.bfloat16
-        if self.config.scale_dtype == "model":    return model_dtype
-        raise ValueError(f"Unsupported scale_dtype: {self.config.scale_dtype}")
-
-    def _v_scale_dtype(self, model_dtype):
-        if self.config.v_scale_dtype == "float16":  return mx.float16
-        if self.config.v_scale_dtype == "bfloat16": return mx.bfloat16
-        if self.config.v_scale_dtype == "model":    return model_dtype
-        raise ValueError(f"Unsupported v_scale_dtype: {self.config.v_scale_dtype}")
-
-    def _cast_scale_out(self, x: mx.array, model_dtype):
-        return x.astype(self._scale_dtype(model_dtype))
-
-    def _cast_scale_in(self, x: mx.array, compute_dtype):
-        return x if x.dtype == compute_dtype else x.astype(compute_dtype)
-
-    def _quantize_resid_proj_scale(self, resid_proj_scale_fp: mx.array, model_dtype):
-        levels = (1 << self.config.resid_scale_bits) - 1
-        mxs = mx.max(resid_proj_scale_fp, axis=-1, keepdims=True)
-        mxs = mx.maximum(mxs, mx.array(self.config.eps, dtype=resid_proj_scale_fp.dtype))
-        q   = mx.round(resid_proj_scale_fp / mxs * levels)
-        q   = mx.clip(q, 0, levels).astype(mx.uint8)
-        return q, self._cast_scale_out(mxs, model_dtype)
-
-    def _dequantize_resid_proj_scale(self, q: mx.array, mxs: mx.array, compute_dtype):
-        levels = float((1 << self.config.resid_scale_bits) - 1)
-        qf  = q.astype(compute_dtype)
-        mxs = self._cast_scale_in(mxs, compute_dtype)
-        return qf * (mxs / levels)
-
-    # ------------------------------------------------------------------
-    # Bit-packing helpers
-    # ------------------------------------------------------------------
-
-    def _get_shifts(self, bits_per_code: int, count: int, dtype) -> mx.array:
-        """Return cached [count] shift array [0, bits, 2*bits, ...]."""
-        key = ("shifts", bits_per_code, count, dtype)
-        if key not in self._array_cache:
-            self._array_cache[key] = mx.array(
-                [i * bits_per_code for i in range(count)], dtype=dtype
-            )
-        return self._array_cache[key]
-
-    def _get_mask(self, bits_per_code: int, dtype) -> mx.array:
-        """Return cached scalar mask for the given bit width."""
-        key = ("mask", bits_per_code, dtype)
-        if key not in self._array_cache:
-            self._array_cache[key] = mx.array(
-                (1 << bits_per_code) - 1, dtype=dtype
-            )
-        return self._array_cache[key]
-
-    def _codes_per_word(self) -> int:
-        return 32 // self.config.main_bits
-
-    def _code_mask(self) -> int:
-        return (1 << self.config.main_bits) - 1
-
-    def _round_up_codes(self, x: int) -> int:
-        cpw = self._codes_per_word()
-        return ((x + cpw - 1) // cpw) * cpw
-
-    def _packed_code_words(self, d_pad: int) -> int:
-        return self._round_up_codes(d_pad) // self._codes_per_word()
-
-    def _pack_main_codes(self, codes: mx.array) -> mx.array:
-        """Pack uint8 codes into uint32 words — vectorised, no Python loop."""
-        bits = self.config.main_bits
-        cpw = self._codes_per_word()          # e.g. 10 for 3-bit
-        d = codes.shape[-1]
-        d_pack = self._round_up_codes(d)
-
-        if d_pack > d:
-            z = mx.zeros((*codes.shape[:-1], d_pack - d), dtype=mx.uint32)
-            words = mx.concatenate([codes.astype(mx.uint32), z], axis=-1)
-        else:
-            words = codes.astype(mx.uint32)
-
-        # [..., d_pack] -> [..., n_words, cpw]
-        words = words.reshape(*words.shape[:-1], d_pack // cpw, cpw)
-
-        # Broadcast shift: words[...,i] << shifts[i], then sum over cpw axis.
-        # Bits are non-overlapping so sum == bitwise_or but uses one kernel.
-        shifts = self._get_shifts(bits, cpw, mx.uint32)  # [cpw]
-        return mx.sum(mx.left_shift(words, shifts), axis=-1)
-
-    def _unpack_main_codes(self, packed: mx.array, d_pad: int) -> mx.array:
-        """Unpack uint32 words into uint8 codes — vectorised, no Python loop."""
-        bits = self.config.main_bits
-        cpw = self._codes_per_word()
-        shifts = self._get_shifts(bits, cpw, mx.uint32)  # [cpw]
-        mask = self._get_mask(bits, mx.uint32)            # scalar
-
-        # packed[..., None]: [..., n_words, 1] >> shifts [cpw] -> [..., n_words, cpw]
-        out = mx.bitwise_and(mx.right_shift(packed[..., None], shifts), mask)
-        out = out.reshape(*out.shape[:-2], out.shape[-2] * cpw)
-        return out[..., :d_pad].astype(mx.uint8)
-
-    def _v_codes_per_word(self) -> int:
-        return 32 // self.config.v_bits
-
-    def _v_code_mask(self) -> int:
-        return (1 << self.config.v_bits) - 1
-
-    def _round_up_v_codes(self, x: int) -> int:
-        cpw = self._v_codes_per_word()
-        return ((x + cpw - 1) // cpw) * cpw
-
-    def _packed_v_words(self, v_pad: int) -> int:
-        return self._round_up_v_codes(v_pad) // self._v_codes_per_word()
-
-    def _pack_v_codes(self, codes: mx.array) -> mx.array:
-        """Pack uint8 V codes into uint32 words — vectorised, no Python loop."""
-        bits = self.config.v_bits
-        cpw = self._v_codes_per_word()
-        d = codes.shape[-1]
-        d_pack = self._round_up_v_codes(d)
-
-        if d_pack > d:
-            z = mx.zeros((*codes.shape[:-1], d_pack - d), dtype=mx.uint32)
-            words = mx.concatenate([codes.astype(mx.uint32), z], axis=-1)
-        else:
-            words = codes.astype(mx.uint32)
-
-        words = words.reshape(*words.shape[:-1], d_pack // cpw, cpw)
-        shifts = self._get_shifts(bits, cpw, mx.uint32)  # [cpw]
-        return mx.sum(mx.left_shift(words, shifts), axis=-1)
-
-    def _unpack_v_codes(self, packed: mx.array, v_pad: int) -> mx.array:
-        """Unpack uint32 words into uint8 V codes — vectorised, no Python loop."""
-        bits = self.config.v_bits
-        cpw = self._v_codes_per_word()
-        shifts = self._get_shifts(bits, cpw, mx.uint32)  # [cpw]
-        mask = self._get_mask(bits, mx.uint32)            # scalar
-
-        out = mx.bitwise_and(mx.right_shift(packed[..., None], shifts), mask)
-        out = out.reshape(*out.shape[:-2], out.shape[-2] * cpw)
-        return out[..., :v_pad].astype(mx.uint8)
-
-    def _pack_group_sign_bits(self, signs_bool):
-        """Pack bool [..., n_groups] into uint8 [..., ceil(n_groups/8)] — vectorised."""
-        n = signs_bool.shape[-1]
-        pad = (-n) % 8
-        signs = signs_bool.astype(mx.uint32)
-        if pad:
-            z = mx.zeros((*signs.shape[:-1], pad), dtype=mx.uint32)
-            signs = mx.concatenate([signs, z], axis=-1)
-
-        n_padded = signs.shape[-1]
-        signs = signs.reshape(*signs.shape[:-1], n_padded // 8, 8)
-        shifts = self._get_shifts(1, 8, mx.uint32)  # [0,1,...,7]
-        return mx.sum(mx.left_shift(signs, shifts), axis=-1).astype(mx.uint8)
-
-    def _unpack_group_sign_bits(self, packed, n_groups: int):
-        """Unpack uint8 [..., n_bytes] into uint8 [..., n_groups] — vectorised."""
-        packed_u32 = packed.astype(mx.uint32)          # [..., n_bytes]
-        n_bytes = packed.shape[-1]
-        shifts = self._get_shifts(1, 8, mx.uint32)     # [0,1,...,7]
-        one = self._get_mask(1, mx.uint32)             # scalar 1
-
-        # [..., n_bytes, 1] >> [8] -> [..., n_bytes, 8]
-        out = mx.bitwise_and(mx.right_shift(packed_u32[..., None], shifts), one)
-        out = out.reshape(*out.shape[:-2], n_bytes * 8)
-        return out[..., :n_groups].astype(mx.uint8)
-
-    # ------------------------------------------------------------------
-    # Misc helpers
-    # ------------------------------------------------------------------
-
-    def _pad_last_dim(self, x, target):
-        pad = target - x.shape[-1]
-        if pad <= 0:
-            return x
-        zeros = mx.zeros((*x.shape[:-1], pad), dtype=x.dtype)
-        return mx.concatenate([x, zeros], axis=-1)
-
-    @staticmethod
-    def _round_up(x: int, multiple: int) -> int:
-        return int(math.ceil(x / multiple) * multiple)
-
-    @staticmethod
-    def _is_power_of_two(x: int) -> bool:
-        return x > 0 and (x & (x - 1)) == 0
+        cfg = TurboQuantConfig(
+            main_bits        = int(main_bits)          if main_bits        else 3,
+            group_size       = int(group_size)         if group_size       else 64,
+            rotation         = rotation                or "identity",
+            return_mode      = return_mode             or "dequant",
+            scale_dtype      = scale_dtype             or "float16",
+            resid_scale_bits = int(resid_scale_bits)   if resid_scale_bits else 8,
+            v_bits           = int(v_bits)             if v_bits           else 4,
+            v_group_size     = int(v_group_size)       if v_group_size     else 64,
+            v_scale_dtype    = v_scale_dtype           or "float16",
+            v_enabled        = (v_enabled == "1"),
+            block_tokens     = int(block_tokens)       if block_tokens     else 256,
+        )
+        obj = cls(cfg)
+        impl = obj._impl
+        pipeline = impl.pipeline
+        pipeline._d_head = int(d_head)    if d_head    else None
+        pipeline._d_pad  = int(d_pad)     if d_pad     else None
+        pipeline._v_dim  = int(value_dim) if value_dim else None
+        pipeline._v_pad  = int(v_pad)     if v_pad     else None
+        impl._dtype      = dtype_name or None
+        obj.state        = state
+        return obj
